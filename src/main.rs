@@ -5,6 +5,7 @@ mod localization;
 mod models;
 mod native_interop;
 mod poller;
+mod provider_icons;
 mod theme;
 mod tray_icon;
 mod updater;

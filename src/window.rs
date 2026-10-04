@@ -25,6 +25,7 @@ use crate::native_interop::{
     WM_APP_USAGE_UPDATED,
 };
 use crate::poller;
+use crate::provider_icons::{self, Provider};
 use crate::theme;
 use crate::tray_icon;
 use crate::updater::{self, InstallChannel, ReleaseDescriptor, UpdateCheckResult};
@@ -1476,9 +1477,7 @@ fn usage_percent_for_display(language: LanguageId, used_percentage: f64) -> f64 
 fn total_widget_width_for(active_models: i32, language: LanguageId) -> i32 {
     let bar_segments = row_bar_segment_count(active_models);
     let (label_width, text_width) = usage_layout_widths(language);
-    let model_width = (sc(SEGMENT_W) + sc(SEGMENT_GAP)) * bar_segments - sc(SEGMENT_GAP)
-        + sc(BAR_RIGHT_MARGIN)
-        + sc(text_width);
+    let model_width = model_usage_width(bar_segments, text_width);
 
     sc(LEFT_DIVIDER_W)
         + sc(DIVIDER_RIGHT_MARGIN)
@@ -1520,14 +1519,6 @@ fn claude_accent_color() -> Color {
     Color::from_hex("#D97757")
 }
 
-fn codex_accent_color(is_dark: bool) -> Color {
-    if is_dark {
-        Color::from_hex("#F5F5F5")
-    } else {
-        Color::from_hex("#1F1F1F")
-    }
-}
-
 fn antigravity_accent_color() -> Color {
     Color::from_hex("#4285F4")
 }
@@ -1537,14 +1528,6 @@ fn claude_usage_text_color(is_dark: bool) -> Color {
         Color::from_hex("#F09A7A")
     } else {
         Color::from_hex("#A94F32")
-    }
-}
-
-fn codex_usage_text_color(is_dark: bool) -> Color {
-    if is_dark {
-        Color::from_hex("#F5F5F5")
-    } else {
-        Color::from_hex("#1F1F1F")
     }
 }
 
@@ -1882,7 +1865,7 @@ fn render_layered() {
     let height = sc(WIDGET_HEIGHT);
 
     let accent = claude_accent_color();
-    let codex_accent = codex_accent_color(is_dark);
+    let codex_accent = provider_icons::codex_color(is_dark);
     let antigravity_accent = antigravity_accent_color();
     let track = if is_dark {
         Color::from_hex("#444444")
@@ -2126,6 +2109,21 @@ fn paint_content(
             PCWSTR::from_raw(font_name.as_ptr()),
         );
         let old_font = SelectObject(hdc, font);
+
+        // One provider mark per column, centered across the visible quota rows.
+        let icon_size = sc(provider_icons::SIZE);
+        let icon_y = (height - icon_size) / 2;
+        let active_models = active_model_count(show_claude_code, show_codex, show_antigravity);
+        let model_width = model_usage_width(row_bar_segment_count(active_models), text_width)
+            + sc(MODEL_RIGHT_MARGIN);
+        let mut icon_x = content_x + sc(label_width) + sc(LABEL_RIGHT_MARGIN);
+        if show_claude_code {
+            provider_icons::draw(hdc, icon_x, icon_y, icon_size, Provider::Claude);
+            icon_x += model_width;
+        }
+        if show_codex {
+            provider_icons::draw(hdc, icon_x, icon_y, icon_size, Provider::Codex);
+        }
 
         if show_session_window {
             draw_row(
@@ -3701,7 +3699,7 @@ fn paint(hdc: HDC, hwnd: HWND) {
     };
 
     let accent = claude_accent_color();
-    let codex_accent = codex_accent_color(is_dark);
+    let codex_accent = provider_icons::codex_color(is_dark);
     let antigravity_accent = antigravity_accent_color();
     let track = if is_dark {
         Color::from_hex("#444444")
@@ -3805,11 +3803,7 @@ fn draw_row(
     } else {
         *text_color
     };
-    let codex_value_color = if use_model_text_colors {
-        codex_usage_text_color(is_dark)
-    } else {
-        *text_color
-    };
+    let codex_value_color = provider_icons::codex_color(is_dark);
     let antigravity_value_color = if use_model_text_colors {
         antigravity_usage_text_color(is_dark)
     } else {
@@ -3836,7 +3830,7 @@ fn draw_row(
         if show_claude_code {
             draw_usage_bar(
                 hdc,
-                model_x,
+                model_x + sc(provider_icons::SIZE + provider_icons::RIGHT_MARGIN),
                 y,
                 segment_count,
                 claude_percent,
@@ -3851,7 +3845,7 @@ fn draw_row(
         if show_codex {
             draw_usage_bar(
                 hdc,
-                model_x,
+                model_x + sc(provider_icons::SIZE + provider_icons::RIGHT_MARGIN),
                 y,
                 segment_count,
                 codex_percent,
@@ -3866,7 +3860,7 @@ fn draw_row(
         if show_antigravity {
             draw_usage_bar(
                 hdc,
-                model_x,
+                model_x + sc(provider_icons::SIZE + provider_icons::RIGHT_MARGIN),
                 y,
                 segment_count,
                 antigravity_percent,
@@ -3881,7 +3875,9 @@ fn draw_row(
 }
 
 fn model_usage_width(segment_count: i32, text_width: i32) -> i32 {
-    (sc(SEGMENT_W) + sc(SEGMENT_GAP)) * segment_count - sc(SEGMENT_GAP)
+    sc(provider_icons::SIZE + provider_icons::RIGHT_MARGIN)
+        + (sc(SEGMENT_W) + sc(SEGMENT_GAP)) * segment_count
+        - sc(SEGMENT_GAP)
         + sc(BAR_RIGHT_MARGIN)
         + sc(text_width)
 }
