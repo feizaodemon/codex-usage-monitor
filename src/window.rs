@@ -21,14 +21,16 @@ use crate::diagnose;
 use crate::localization::{self, LanguageId, Strings};
 use crate::models::AppUsageData;
 use crate::native_interop::{
-    self, Color, TIMER_COUNTDOWN, TIMER_FRESHNESS, TIMER_POLL, TIMER_RESET_POLL,
-    TIMER_UPDATE_CHECK, WM_APP_TRAY, WM_APP_USAGE_UPDATED,
+    self, Color, TIMER_COUNTDOWN, TIMER_FRESHNESS, TIMER_POLL, TIMER_UPDATE_CHECK, WM_APP_TRAY,
+    WM_APP_USAGE_UPDATED,
 };
 use crate::poller;
 use crate::provider_icons::{self, Provider};
+use crate::provider_poll;
 use crate::quota_refresh;
 use crate::quota_text;
 use crate::quota_tooltip;
+use crate::recovery_events;
 use crate::settings_store;
 use crate::theme;
 use crate::tray_icon;
@@ -86,14 +88,10 @@ struct AppState {
 
     poll_interval_ms: u32,
     adaptive_refresh: bool,
-    refresh_history: quota_refresh::History,
-    reset_refresh: quota_refresh::ResetRefresh,
-    retry_count: u32,
-    force_notify_auth_error: bool,
-    auth_error_paused_polling: bool,
-    auth_watch_mode: poller::CredentialWatchMode,
-    auth_watch_snapshot: poller::CredentialWatchSnapshot,
-    last_poll_ok: bool,
+    monitor: provider_poll::Monitor,
+    recovery_watch: Option<recovery_events::Watch>,
+    recovery_debounce: recovery_events::Debounce,
+    has_poll_result: bool,
     update_status: UpdateStatus,
     last_update_check_unix: Option<u64>,
 
@@ -709,7 +707,7 @@ fn append_quota_alert(
 fn tray_icon_data_from_state() -> Option<tray_icon::TrayIconData> {
     let state = lock_state();
     match state.as_ref() {
-        Some(s) if s.last_poll_ok => {
+        Some(s) if s.has_poll_result => {
             let mut services = Vec::new();
             let strings = s.language.strings();
             if s.show_claude_code {
@@ -930,23 +928,12 @@ fn schedule_auto_update_check(hwnd: HWND) {
 }
 
 fn effective_poll_interval(state: &AppState) -> u32 {
-    let providers = state.data.iter().flat_map(|d| {
-        [
-            d.claude_code.as_ref().filter(|_| state.show_claude_code),
-            d.codex.as_ref().filter(|_| state.show_codex),
-            d.antigravity.as_ref().filter(|_| state.show_antigravity),
-        ]
-        .into_iter()
-        .flatten()
-    });
-    quota_refresh::interval_ms(state.poll_interval_ms, state.adaptive_refresh, providers)
+    state
+        .monitor
+        .delay_ms(Instant::now(), state.poll_interval_ms)
 }
 
 fn refresh_usage_texts(state: &mut AppState) {
-    if !state.last_poll_ok {
-        return;
-    }
-
     let strings = state.language.strings();
     let show_remaining = state.language == LanguageId::SimplifiedChinese;
     let Some(data) = state.data.as_ref() else {
@@ -967,8 +954,12 @@ fn refresh_usage_texts(state: &mut AppState) {
             poller::UsageWindowKind::Weekly,
         );
     } else if state.show_claude_code {
-        state.session_text = "!".to_string();
-        state.weekly_text = "!".to_string();
+        let label = state.monitor.services[0]
+            .error
+            .map(|e| poll_error_display_label(e, state.language))
+            .unwrap_or("...");
+        state.session_text = label.to_string();
+        state.weekly_text = label.to_string();
     }
 
     if let Some(codex) = data.codex.as_ref() {
@@ -985,8 +976,12 @@ fn refresh_usage_texts(state: &mut AppState) {
             poller::UsageWindowKind::Weekly,
         );
     } else if state.show_codex {
-        state.codex_session_text = "!".to_string();
-        state.codex_weekly_text = "!".to_string();
+        let label = state.monitor.services[1]
+            .error
+            .map(|e| poll_error_display_label(e, state.language))
+            .unwrap_or("...");
+        state.codex_session_text = label.to_string();
+        state.codex_weekly_text = label.to_string();
     }
 
     if let Some(antigravity) = data.antigravity.as_ref() {
@@ -1008,19 +1003,29 @@ fn refresh_usage_texts(state: &mut AppState) {
                 )
             };
     } else if state.show_antigravity {
-        state.antigravity_session_text = "!".to_string();
-        state.antigravity_weekly_text = "!".to_string();
+        let label = state.monitor.services[2]
+            .error
+            .map(|e| poll_error_display_label(e, state.language))
+            .unwrap_or("...");
+        state.antigravity_session_text = label.to_string();
+        state.antigravity_weekly_text = label.to_string();
     }
-    let stale = state.refresh_history.is_stale(SystemTime::now());
-    for text in [
-        &mut state.session_text,
-        &mut state.weekly_text,
-        &mut state.codex_session_text,
-        &mut state.codex_weekly_text,
-        &mut state.antigravity_session_text,
-        &mut state.antigravity_weekly_text,
+    for (id, session, weekly) in [
+        (0, &mut state.session_text, &mut state.weekly_text),
+        (
+            1,
+            &mut state.codex_session_text,
+            &mut state.codex_weekly_text,
+        ),
+        (
+            2,
+            &mut state.antigravity_session_text,
+            &mut state.antigravity_weekly_text,
+        ),
     ] {
-        quota_refresh::mark_stale(text, stale);
+        let stale = state.monitor.services[id].stale(SystemTime::now());
+        quota_refresh::mark_stale(session, stale);
+        quota_refresh::mark_stale(weekly, stale);
     }
 }
 
@@ -1735,14 +1740,17 @@ pub fn run() {
                 data: None,
                 poll_interval_ms: settings.poll_interval_ms,
                 adaptive_refresh: settings.adaptive_refresh,
-                refresh_history: quota_refresh::History::default(),
-                reset_refresh: quota_refresh::ResetRefresh::default(),
-                retry_count: 0,
-                force_notify_auth_error: false,
-                auth_error_paused_polling: false,
-                auth_watch_mode: poller::CredentialWatchMode::ActiveSource,
-                auth_watch_snapshot: Vec::new(),
-                last_poll_ok: false,
+                monitor: provider_poll::Monitor::new(
+                    [
+                        settings.show_claude_code,
+                        settings.show_codex,
+                        settings.show_antigravity,
+                    ],
+                    Instant::now(),
+                ),
+                recovery_watch: Some(recovery_events::Watch::register(hwnd)),
+                recovery_debounce: recovery_events::Debounce::default(),
+                has_poll_result: false,
                 update_status: UpdateStatus::Idle,
                 last_update_check_unix: settings.last_update_check_unix,
                 taskbar_index: settings.taskbar_index,
@@ -1848,30 +1856,23 @@ fn update_quota_tooltips() {
                 + sc(DIVIDER_RIGHT_MARGIN)
                 + sc(label_width)
                 + sc(LABEL_RIGHT_MARGIN);
-            let description = s.refresh_history.description(
-                SystemTime::now(),
-                chinese,
-                s.last_poll_ok,
-                if s.retry_count > 0 && !s.auth_error_paused_polling {
-                    quota_refresh::retry_interval_ms(s.poll_interval_ms, s.retry_count)
-                } else {
-                    effective_poll_interval(s)
-                },
-            );
-            for (visible, name, session, weekly) in [
+            for (id, visible, name, session, weekly) in [
                 (
+                    0,
                     s.show_claude_code,
                     "Claude Code",
                     &s.session_text,
                     &s.weekly_text,
                 ),
                 (
+                    1,
                     s.show_codex,
                     "Codex",
                     &s.codex_session_text,
                     &s.codex_weekly_text,
                 ),
                 (
+                    2,
                     s.show_antigravity,
                     "Antigravity",
                     &s.antigravity_session_text,
@@ -1881,15 +1882,16 @@ fn update_quota_tooltips() {
                 if !visible {
                     continue;
                 }
+                let description = s.monitor.services[id].description(SystemTime::now(), chinese);
                 let mut text = format!("{name}\n{description}");
-                if s.last_poll_ok && session == "!" {
+                if s.monitor.services[id].error.is_some() && session == "!" {
                     text.push_str(if chinese {
                         "\n本服务本次未返回额度。"
                     } else {
                         "\nThis provider did not return quota in the latest update."
                     });
                 }
-                if name == "Codex" && s.last_poll_ok {
+                if name == "Codex" && s.monitor.services[id].data.is_some() {
                     for (missing, is_weekly) in [(session == "--", false), (weekly == "--", true)] {
                         if missing {
                             text.push('\n');
@@ -2346,7 +2348,21 @@ fn poll_error_display_label(error: poller::PollError, language: LanguageId) -> &
     }
 }
 
-fn request_poll(hwnd: SendHwnd, queue: bool) {
+fn request_poll(hwnd: SendHwnd, force: bool) {
+    {
+        let mut state = lock_state();
+        if let Some(s) = state.as_mut() {
+            let enabled = [s.show_claude_code, s.show_codex, s.show_antigravity];
+            s.monitor.configure(enabled, Instant::now());
+            if force {
+                s.monitor.force(Instant::now(), true);
+            }
+        }
+    }
+    start_poll(hwnd, force);
+}
+
+fn start_poll(hwnd: SendHwnd, queue: bool) {
     let Some(mut guard) = quota_refresh::POLLS.request(queue) else {
         return;
     };
@@ -2363,217 +2379,112 @@ fn request_poll(hwnd: SendHwnd, queue: bool) {
     }
 }
 
-fn provider_selection(state: &AppState) -> (bool, bool, bool) {
-    (
-        state.show_claude_code,
-        state.show_codex,
-        state.show_antigravity,
-    )
-}
-
 fn do_poll(send_hwnd: SendHwnd) {
     let hwnd = send_hwnd.to_hwnd();
-    let (show_claude_code, show_codex, show_antigravity) = {
-        let state = lock_state();
-        state
-            .as_ref()
-            .map(provider_selection)
-            .unwrap_or((true, false, false))
+    let jobs = {
+        let mut state = lock_state();
+        let Some(s) = state.as_mut() else {
+            return;
+        };
+        s.monitor.plan(Instant::now())
     };
-
-    match poller::poll(show_claude_code, show_codex, show_antigravity) {
-        Ok(data) => {
+    for job in jobs {
+        let attempt = provider_poll::execute(
+            &job,
+            || poller::poll_provider(job.id),
+            poller::credential_watch_snapshot,
+        );
+        let (alerts, auth_notice) = {
             let mut state = lock_state();
-            let mut quota_alerts = Vec::new();
-            if let Some(s) = state.as_mut() {
-                if provider_selection(s) != (show_claude_code, show_codex, show_antigravity) {
-                    return;
-                }
-                if let Some(claude_code) = data.claude_code.as_ref() {
-                    s.session_percent = claude_code.session.percentage;
-                    s.weekly_percent = claude_code.weekly.percentage;
-                } else if s.show_claude_code {
-                    s.session_percent = 0.0;
-                    s.weekly_percent = 0.0;
-                }
-                if let Some(codex) = data.codex.as_ref() {
-                    s.codex_session_percent = codex.session.percentage;
-                    s.codex_weekly_percent = codex.weekly.percentage;
-                } else if s.show_codex {
-                    s.codex_session_percent = 0.0;
-                    s.codex_weekly_percent = 0.0;
-                }
-                if let Some(antigravity) = data.antigravity.as_ref() {
-                    s.antigravity_session_percent = antigravity.session.percentage;
-                    s.antigravity_weekly_percent = antigravity.weekly.percentage;
-                } else if s.show_antigravity {
-                    s.antigravity_session_percent = 0.0;
-                    s.antigravity_weekly_percent = 0.0;
-                }
-                // Stop fast-poll if reset data is now fresh
-                if !poller::app_is_past_reset(&data) {
-                    unsafe {
-                        let _ = KillTimer(hwnd, TIMER_RESET_POLL);
-                    }
-                }
-
-                quota_alerts = collect_low_quota_alerts(s, &data);
-                s.data = Some(data);
-                s.last_poll_ok = true;
-                let interval = effective_poll_interval(s);
-                diagnose::log(format!("usage poll succeeded interval_ms={interval}"));
-                s.refresh_history
-                    .record_success(SystemTime::now(), interval);
-                refresh_usage_texts(s);
-                s.retry_count = 0;
-                unsafe {
-                    SetTimer(hwnd, TIMER_POLL, interval, None);
-                }
-                s.force_notify_auth_error = false;
-                s.auth_error_paused_polling = false;
-                s.auth_watch_mode = poller::CredentialWatchMode::ActiveSource;
-                s.auth_watch_snapshot.clear();
+            let Some(s) = state.as_mut() else {
+                return;
+            };
+            let completion = s.monitor.finish(
+                &job,
+                attempt,
+                Instant::now(),
+                SystemTime::now(),
+                s.poll_interval_ms,
+                s.adaptive_refresh,
+            );
+            if !completion.accepted {
+                continue;
             }
-            drop(state);
-
-            for alert in &quota_alerts {
-                tray_icon::notify_balloon(hwnd, alert.kind, &alert.title, &alert.message);
-                diagnose::log(format!(
-                    "low quota alert emitted title={} message={}",
-                    alert.title, alert.message
-                ));
+            let mut fresh = AppUsageData::default();
+            if completion.successful {
+                let data = s.monitor.services[job.id].data.clone();
+                match job.id {
+                    0 => fresh.claude_code = data,
+                    1 => fresh.codex = data,
+                    _ => fresh.antigravity = data,
+                }
             }
-            if !quota_alerts.is_empty() {
-                save_state_settings();
+            let alerts = collect_low_quota_alerts(s, &fresh);
+            let cached = s.monitor.cached();
+            for (usage, session, weekly) in [
+                (
+                    cached.claude_code.as_ref(),
+                    &mut s.session_percent,
+                    &mut s.weekly_percent,
+                ),
+                (
+                    cached.codex.as_ref(),
+                    &mut s.codex_session_percent,
+                    &mut s.codex_weekly_percent,
+                ),
+                (
+                    cached.antigravity.as_ref(),
+                    &mut s.antigravity_session_percent,
+                    &mut s.antigravity_weekly_percent,
+                ),
+            ] {
+                *session = usage.map_or(0.0, |u| u.session.percentage);
+                *weekly = usage.map_or(0.0, |u| u.weekly.percentage);
             }
-
+            s.data = Some(cached);
+            s.has_poll_result = true;
+            refresh_usage_texts(s);
             unsafe {
-                let _ = PostMessageW(hwnd, WM_APP_USAGE_UPDATED, WPARAM(0), LPARAM(0));
+                SetTimer(hwnd, TIMER_POLL, effective_poll_interval(s), None);
             }
+            let service = &s.monitor.services[job.id];
+            diagnose::log(format!(
+                "provider poll completed id={} error={:?} interval_ms={}",
+                job.id, service.error, service.interval_ms
+            ));
+            let notice = completion.notify_auth.then(|| {
+                let strings = s.language.strings();
+                match job.id {
+                    0 => (
+                        tray_icon::TrayIconKind::Claude,
+                        strings.token_expired_title,
+                        strings.token_expired_body,
+                    ),
+                    1 => (
+                        tray_icon::TrayIconKind::Codex,
+                        strings.codex_token_expired_title,
+                        strings.codex_token_expired_body,
+                    ),
+                    _ => (
+                        tray_icon::TrayIconKind::Antigravity,
+                        strings.antigravity_token_expired_title,
+                        strings.antigravity_token_expired_body,
+                    ),
+                }
+            });
+            (alerts, notice)
+        };
+        for alert in &alerts {
+            tray_icon::notify_balloon(hwnd, alert.kind, &alert.title, &alert.message);
         }
-        Err(e) => {
-            let auth_watch = match e {
-                poller::PollError::AuthRequired | poller::PollError::TokenExpired
-                    if show_antigravity && !show_claude_code && !show_codex =>
-                {
-                    Some((
-                        poller::CredentialWatchMode::Antigravity,
-                        poller::credential_watch_snapshot(poller::CredentialWatchMode::Antigravity),
-                    ))
-                }
-                poller::PollError::AuthRequired | poller::PollError::TokenExpired => Some((
-                    poller::CredentialWatchMode::ActiveSource,
-                    poller::credential_watch_snapshot(poller::CredentialWatchMode::ActiveSource),
-                )),
-                poller::PollError::NoCredentials => Some((
-                    poller::CredentialWatchMode::AllSources,
-                    poller::credential_watch_snapshot(poller::CredentialWatchMode::AllSources),
-                )),
-                poller::PollError::NetworkUnavailable
-                | poller::PollError::RateLimited
-                | poller::PollError::ServerError
-                | poller::PollError::RequestFailed => None,
-            };
-            // Distinguish auth-required errors from transient errors.
-            let notify_auth_error = {
-                let mut state = lock_state();
-                let mut should_notify = false;
-                if let Some(s) = state.as_mut() {
-                    if provider_selection(s) != (show_claude_code, show_codex, show_antigravity) {
-                        return;
-                    }
-                    s.last_poll_ok = false;
-                    match auth_watch {
-                        Some((watch_mode, watch_snapshot)) => {
-                            // Only show the balloon on the first failure so it doesn't spam.
-                            if s.retry_count == 0 || s.force_notify_auth_error {
-                                should_notify = true;
-                            }
-                            s.force_notify_auth_error = false;
-                            s.auth_error_paused_polling = true;
-                            s.auth_watch_mode = watch_mode;
-                            s.auth_watch_snapshot = watch_snapshot;
-                            s.session_text = "!".to_string();
-                            s.weekly_text = "!".to_string();
-                            s.codex_session_text = "!".to_string();
-                            s.codex_weekly_text = "!".to_string();
-                            s.antigravity_session_text = "!".to_string();
-                            s.antigravity_weekly_text = "!".to_string();
-                            s.retry_count = s.retry_count.saturating_add(1);
-                            unsafe {
-                                let _ = KillTimer(hwnd, TIMER_POLL);
-                                let _ = KillTimer(hwnd, TIMER_RESET_POLL);
-                                let _ = KillTimer(hwnd, TIMER_COUNTDOWN);
-                                SetTimer(hwnd, TIMER_POLL, s.poll_interval_ms, None);
-                            }
-                        }
-                        _ => {
-                            // Transient network, rate-limit, server, or response errors: exponential backoff.
-                            s.force_notify_auth_error = false;
-                            s.auth_error_paused_polling = false;
-                            s.auth_watch_mode = poller::CredentialWatchMode::ActiveSource;
-                            s.auth_watch_snapshot.clear();
-                            let label = poll_error_display_label(e, s.language).to_string();
-                            s.session_text = label.clone();
-                            s.weekly_text = label.clone();
-                            s.codex_session_text = label.clone();
-                            s.codex_weekly_text = label.clone();
-                            s.antigravity_session_text = label.clone();
-                            s.antigravity_weekly_text = label;
-                            s.retry_count = s.retry_count.saturating_add(1);
-                            let retry_ms =
-                                quota_refresh::retry_interval_ms(s.poll_interval_ms, s.retry_count);
-                            diagnose::log(format!(
-                                "usage poll failed category={} retry={} retry_ms={retry_ms}",
-                                e.category(),
-                                s.retry_count
-                            ));
-                            unsafe {
-                                let _ = KillTimer(hwnd, TIMER_RESET_POLL);
-                                SetTimer(hwnd, TIMER_POLL, retry_ms, None);
-                            }
-                        }
-                    }
-                }
-                should_notify
-            };
-
-            if notify_auth_error {
-                let balloon = {
-                    let state = lock_state();
-                    state.as_ref().map(|s| {
-                        if s.show_claude_code {
-                            (
-                                s.language.strings(),
-                                tray_icon::TrayIconKind::Claude,
-                                s.language.strings().token_expired_title,
-                                s.language.strings().token_expired_body,
-                            )
-                        } else if s.show_codex {
-                            (
-                                s.language.strings(),
-                                tray_icon::TrayIconKind::Codex,
-                                s.language.strings().codex_token_expired_title,
-                                s.language.strings().codex_token_expired_body,
-                            )
-                        } else {
-                            (
-                                s.language.strings(),
-                                tray_icon::TrayIconKind::Antigravity,
-                                s.language.strings().antigravity_token_expired_title,
-                                s.language.strings().antigravity_token_expired_body,
-                            )
-                        }
-                    })
-                };
-                if let Some((_strings, kind, title, body)) = balloon {
-                    tray_icon::notify_balloon(hwnd, kind, title, body);
-                }
-            }
-
-            unsafe {
-                let _ = PostMessageW(hwnd, WM_APP_USAGE_UPDATED, WPARAM(0), LPARAM(0));
-            }
+        if !alerts.is_empty() {
+            save_state_settings();
+        }
+        if let Some((kind, title, body)) = auth_notice {
+            tray_icon::notify_balloon(hwnd, kind, title, body);
+        }
+        unsafe {
+            let _ = PostMessageW(hwnd, WM_APP_USAGE_UPDATED, WPARAM(0), LPARAM(0));
         }
     }
 }
@@ -2586,29 +2497,9 @@ fn schedule_countdown_timer() {
     };
 
     let hwnd = s.hwnd.to_hwnd();
-    if !s.last_poll_ok {
-        unsafe {
-            let _ = KillTimer(hwnd, TIMER_COUNTDOWN);
-            let _ = KillTimer(hwnd, TIMER_RESET_POLL);
-        }
+    let Some(data) = s.data.as_ref() else {
         return;
-    }
-
-    let data = match &s.data {
-        Some(d) => d,
-        None => return,
     };
-
-    let reset = poller::latest_past_reset(data, SystemTime::now());
-    let reset_interval = s.reset_refresh.interval_ms(reset, Instant::now());
-    unsafe {
-        if let Some(interval) = reset_interval {
-            SetTimer(hwnd, TIMER_RESET_POLL, interval, None);
-        } else {
-            let _ = KillTimer(hwnd, TIMER_RESET_POLL);
-        }
-    }
-
     let delays = [
         data.claude_code
             .as_ref()
@@ -2673,11 +2564,6 @@ fn update_display() {
         Some(s) => s,
         None => return,
     };
-
-    // Don't overwrite error text with stale cached data
-    if !s.last_poll_ok {
-        return;
-    }
 
     refresh_usage_texts(s);
 }
@@ -2842,6 +2728,28 @@ unsafe extern "system" fn on_tray_location_changed(
     }
 }
 
+fn recover_polling(hwnd: HWND, network: bool) {
+    let accepted = {
+        let mut state = lock_state();
+        state.as_mut().is_some_and(|s| {
+            let now = Instant::now();
+            if !s.recovery_debounce.accept(network, now) {
+                return false;
+            }
+            s.monitor.force(now, false);
+            true
+        })
+    };
+    if accepted {
+        diagnose::log(if network {
+            "network restored: refreshing providers"
+        } else {
+            "system resumed: refreshing providers"
+        });
+        start_poll(SendHwnd::from_hwnd(hwnd), true);
+    }
+}
+
 /// Main window procedure
 unsafe extern "system" fn wnd_proc(
     hwnd: HWND,
@@ -2870,6 +2778,17 @@ unsafe extern "system" fn wnd_proc(
             LRESULT(0)
         }
         WM_ERASEBKGND => LRESULT(1),
+        WM_POWERBROADCAST
+            if wparam.0 == PBT_APMRESUMEAUTOMATIC as usize
+                || wparam.0 == PBT_APMRESUMESUSPEND as usize =>
+        {
+            recover_polling(hwnd, false);
+            LRESULT(1)
+        }
+        _ if msg == recovery_events::MESSAGE => {
+            recover_polling(hwnd, true);
+            LRESULT(0)
+        }
         WM_DISPLAYCHANGE | WM_DPICHANGED_MSG | WM_SETTINGCHANGE => {
             if msg == WM_DPICHANGED_MSG {
                 let new_dpi = (wparam.0 & 0xFFFF) as u32;
@@ -2888,68 +2807,12 @@ unsafe extern "system" fn wnd_proc(
             let timer_id = wparam.0;
             match timer_id {
                 TIMER_POLL => {
-                    let auth_watch = {
-                        let state = lock_state();
-                        state.as_ref().map(|s| {
-                            (
-                                s.auth_error_paused_polling,
-                                s.auth_watch_mode,
-                                s.auth_watch_snapshot.clone(),
-                            )
-                        })
-                    };
-                    match auth_watch {
-                        Some((true, watch_mode, previous_snapshot)) => {
-                            let current_snapshot = poller::credential_watch_snapshot(watch_mode);
-                            if current_snapshot != previous_snapshot {
-                                let mut state = lock_state();
-                                if let Some(s) = state.as_mut() {
-                                    if s.auth_error_paused_polling
-                                        && s.auth_watch_mode == watch_mode
-                                    {
-                                        s.auth_watch_snapshot = current_snapshot;
-                                    }
-                                }
-                                drop(state);
-                                let sh = SendHwnd::from_hwnd(hwnd);
-                                request_poll(sh, true);
-                            }
-                        }
-                        Some((false, _, _)) => {
-                            let sh = SendHwnd::from_hwnd(hwnd);
-                            request_poll(sh, false);
-                        }
-                        None => {}
-                    }
+                    request_poll(SendHwnd::from_hwnd(hwnd), false);
                 }
                 TIMER_COUNTDOWN => {
                     update_display();
                     render_layered();
                     schedule_countdown_timer();
-                }
-                TIMER_RESET_POLL => {
-                    let should_poll = {
-                        let mut state = lock_state();
-                        state
-                            .as_mut()
-                            .map(|s| {
-                                let reset = s.data.as_ref().and_then(|data| {
-                                    poller::latest_past_reset(data, SystemTime::now())
-                                });
-                                let interval = s.reset_refresh.interval_ms(reset, Instant::now());
-                                if let Some(interval) = interval {
-                                    SetTimer(hwnd, TIMER_RESET_POLL, interval, None);
-                                } else {
-                                    let _ = KillTimer(hwnd, TIMER_RESET_POLL);
-                                }
-                                interval.is_some() && s.last_poll_ok && !s.auth_error_paused_polling
-                            })
-                            .unwrap_or(false)
-                    };
-                    if should_poll {
-                        let sh = SendHwnd::from_hwnd(hwnd);
-                        request_poll(sh, false);
-                    }
                 }
                 TIMER_FRESHNESS => {
                     update_display();
@@ -3166,7 +3029,6 @@ unsafe extern "system" fn wnd_proc(
                             s.weekly_text = "...".to_string();
                             s.codex_session_text = "...".to_string();
                             s.codex_weekly_text = "...".to_string();
-                            s.force_notify_auth_error = true;
                         }
                     }
                     render_layered();
@@ -3240,10 +3102,14 @@ unsafe extern "system" fn wnd_proc(
                         let mut state = lock_state();
                         if let Some(s) = state.as_mut() {
                             s.poll_interval_ms = new_interval;
-                            if s.last_poll_ok {
-                                let interval = effective_poll_interval(s);
-                                s.refresh_history.expected_interval_ms = interval;
-                                SetTimer(hwnd, TIMER_POLL, interval, None);
+                            if s.has_poll_result {
+                                s.monitor.reconfigure(
+                                    s.poll_interval_ms,
+                                    s.adaptive_refresh,
+                                    Instant::now(),
+                                    SystemTime::now(),
+                                );
+                                SetTimer(hwnd, TIMER_POLL, effective_poll_interval(s), None);
                             }
                         }
                     }
@@ -3254,10 +3120,14 @@ unsafe extern "system" fn wnd_proc(
                         let mut state = lock_state();
                         if let Some(s) = state.as_mut() {
                             s.adaptive_refresh = !s.adaptive_refresh;
-                            if s.last_poll_ok {
-                                let interval = effective_poll_interval(s);
-                                s.refresh_history.expected_interval_ms = interval;
-                                SetTimer(hwnd, TIMER_POLL, interval, None);
+                            if s.has_poll_result {
+                                s.monitor.reconfigure(
+                                    s.poll_interval_ms,
+                                    s.adaptive_refresh,
+                                    Instant::now(),
+                                    SystemTime::now(),
+                                );
+                                SetTimer(hwnd, TIMER_POLL, effective_poll_interval(s), None);
                             }
                         }
                     }
@@ -3412,6 +3282,11 @@ unsafe extern "system" fn wnd_proc(
             LRESULT(0)
         }
         WM_DESTROY => {
+            let watch = {
+                let mut state = lock_state();
+                state.as_mut().and_then(|s| s.recovery_watch.take())
+            };
+            drop(watch);
             quota_tooltip::clear();
             let hook = {
                 let state = lock_state();

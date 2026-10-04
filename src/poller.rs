@@ -11,7 +11,7 @@ use std::os::windows::process::CommandExt;
 
 use crate::diagnose;
 use crate::localization::Strings;
-use crate::models::{AppUsageData, UsageData, UsageSection};
+use crate::models::{UsageData, UsageSection};
 use crate::native_interop;
 
 const USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
@@ -63,6 +63,7 @@ pub enum CredentialWatchMode {
     ActiveSource,
     AllSources,
     Antigravity,
+    Codex,
 }
 
 pub type CredentialWatchSnapshot = Vec<String>;
@@ -198,80 +199,19 @@ extern "system" {
     fn CredFree(buffer: *mut c_void);
 }
 
-pub fn poll(
-    show_claude_code: bool,
-    show_codex: bool,
-    show_antigravity: bool,
-) -> Result<AppUsageData, PollError> {
-    poll_with(
-        show_claude_code,
-        show_codex,
-        show_antigravity,
-        poll_claude_code,
-        poll_codex,
-        poll_antigravity,
-    )
+pub fn poll_provider(id: usize) -> Result<UsageData, PollError> {
+    match id {
+        0 => poll_claude_code(),
+        1 => poll_codex(),
+        2 => poll_antigravity(),
+        _ => Err(PollError::RequestFailed),
+    }
 }
 
 /// Whether Claude Code CLI credentials are available from a supported source.
 /// Claude Desktop authentication is intentionally not treated as CLI access.
 pub fn claude_code_credentials_available() -> bool {
     read_first_credentials().is_some()
-}
-
-fn poll_with(
-    show_claude_code: bool,
-    show_codex: bool,
-    show_antigravity: bool,
-    mut poll_claude_code: impl FnMut() -> Result<UsageData, PollError>,
-    mut poll_codex: impl FnMut() -> Result<UsageData, PollError>,
-    mut poll_antigravity: impl FnMut() -> Result<UsageData, PollError>,
-) -> Result<AppUsageData, PollError> {
-    let mut data = AppUsageData::default();
-    let mut first_error = None;
-    let active_provider_count = show_claude_code as u8 + show_codex as u8 + show_antigravity as u8;
-
-    if show_claude_code {
-        match poll_claude_code() {
-            Ok(claude_code) => data.claude_code = Some(claude_code),
-            Err(error) => {
-                if active_provider_count > 1 {
-                    diagnose::log(format!("Claude Code usage poll failed: {error:?}"));
-                }
-                first_error.get_or_insert(error);
-            }
-        }
-    }
-
-    if show_codex {
-        match poll_codex() {
-            Ok(codex) => data.codex = Some(codex),
-            Err(error) => {
-                if active_provider_count > 1 {
-                    diagnose::log(format!("Codex usage poll failed: {error:?}"));
-                }
-                first_error.get_or_insert(error);
-            }
-        }
-    }
-
-    if show_antigravity {
-        match poll_antigravity() {
-            Ok(antigravity) => data.antigravity = Some(antigravity),
-            Err(error) => {
-                if active_provider_count > 1 {
-                    diagnose::log(format!("Antigravity usage poll failed: {error:?}"));
-                }
-                first_error.get_or_insert(error);
-            }
-        }
-    }
-
-    if data.claude_code.is_none() && data.codex.is_none() && data.antigravity.is_none() {
-        Err(first_error.unwrap_or(PollError::RequestFailed))
-    } else {
-        Ok(data)
-    }
 }
 
 fn poll_claude_code() -> Result<UsageData, PollError> {
@@ -613,6 +553,11 @@ fn classify_ureq_error(error: &ureq::Error) -> PollError {
 }
 
 pub fn credential_watch_snapshot(mode: CredentialWatchMode) -> CredentialWatchSnapshot {
+    if mode == CredentialWatchMode::Codex {
+        return codex_auth_path()
+            .map(|p| vec![windows_credential_watch_signature(&p)])
+            .unwrap_or_default();
+    }
     if mode == CredentialWatchMode::Antigravity {
         return vec![antigravity_credential_watch_signature()];
     }
@@ -622,7 +567,7 @@ pub fn credential_watch_snapshot(mode: CredentialWatchMode) -> CredentialWatchSn
             .map(|creds| vec![creds.source])
             .unwrap_or_else(all_known_credential_sources),
         CredentialWatchMode::AllSources => all_known_credential_sources(),
-        CredentialWatchMode::Antigravity => unreachable!(),
+        CredentialWatchMode::Antigravity | CredentialWatchMode::Codex => unreachable!(),
     };
 
     let mut snapshot: CredentialWatchSnapshot = sources
@@ -676,7 +621,7 @@ fn windows_credential_watch_signature(path: &PathBuf) -> String {
                 .modified()
                 .ok()
                 .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
-                .map(|value| value.as_secs())
+                .map(|value| value.as_nanos())
                 .unwrap_or(0);
             format!("{key}|present|{}|{modified}", metadata.len())
         }
@@ -1731,28 +1676,30 @@ fn time_until_display_change_from_secs(total_secs: u64) -> Duration {
     Duration::from_secs(total_secs.saturating_sub(current_bucket_start) + 1)
 }
 
-/// Stable identity of the most recently elapsed quota window.
-pub fn latest_past_reset(data: &AppUsageData, now: SystemTime) -> Option<SystemTime> {
-    [
-        data.claude_code.as_ref(),
-        data.codex.as_ref(),
-        data.antigravity.as_ref(),
-    ]
-    .into_iter()
-    .flatten()
-    .flat_map(|usage| [usage.session.resets_at, usage.weekly.resets_at])
-    .flatten()
-    .filter(|reset| *reset <= now)
-    .max()
-}
-
-pub fn app_is_past_reset(data: &AppUsageData) -> bool {
-    latest_past_reset(data, SystemTime::now()).is_some()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn credential_signature_detects_same_length_rewrites_within_one_second() {
+        let path = std::env::temp_dir().join(format!(
+            "quota-credential-signature-{}.json",
+            std::process::id()
+        ));
+        let mut file = std::fs::File::create(&path).unwrap();
+        use std::io::Write;
+        file.write_all(b"fixture").unwrap();
+        let time = UNIX_EPOCH + Duration::from_secs(1700000000);
+        file.set_modified(time + Duration::from_millis(100))
+            .unwrap();
+        let before = windows_credential_watch_signature(&path);
+        file.set_modified(time + Duration::from_millis(200))
+            .unwrap();
+        let after = windows_credential_watch_signature(&path);
+        assert_ne!(before, after);
+        drop(file);
+        std::fs::remove_file(path).unwrap();
+    }
 
     #[test]
     fn claude_credentials_path_honors_custom_config_directory() {
@@ -1767,16 +1714,6 @@ mod tests {
             windows_credentials_path_from(None, Some(PathBuf::from(r"C:\Users\Ray"))),
             Some(PathBuf::from(r"C:\Users\Ray\.claude\.credentials.json"))
         );
-    }
-
-    fn usage_with_session_percent(percentage: f64) -> UsageData {
-        UsageData {
-            session: UsageSection {
-                percentage,
-                resets_at: None,
-            },
-            weekly: UsageSection::default(),
-        }
     }
 
     #[test]
@@ -1920,69 +1857,6 @@ mod tests {
             format_simplified_chinese_values(97.0, Some(weekly_reset), UsageWindowKind::Weekly,),
             "97%  07/17重置"
         );
-    }
-
-    #[test]
-    fn claude_failure_does_not_block_codex_when_both_are_enabled() {
-        let data = poll_with(
-            true,
-            true,
-            false,
-            || Err(PollError::AuthRequired),
-            || Ok(usage_with_session_percent(42.0)),
-            || unreachable!("antigravity is disabled"),
-        )
-        .expect("codex data should keep the poll successful");
-
-        assert!(data.claude_code.is_none());
-        assert_eq!(data.codex.unwrap().session.percentage, 42.0);
-    }
-
-    #[test]
-    fn codex_failure_does_not_block_claude_when_both_are_enabled() {
-        let data = poll_with(
-            true,
-            true,
-            false,
-            || Ok(usage_with_session_percent(64.0)),
-            || Err(PollError::RequestFailed),
-            || unreachable!("antigravity is disabled"),
-        )
-        .expect("claude data should keep the poll successful");
-
-        assert_eq!(data.claude_code.unwrap().session.percentage, 64.0);
-        assert!(data.codex.is_none());
-    }
-
-    #[test]
-    fn returns_first_error_when_no_enabled_provider_succeeds() {
-        let error = poll_with(
-            true,
-            true,
-            true,
-            || Err(PollError::AuthRequired),
-            || Err(PollError::RequestFailed),
-            || Err(PollError::NoCredentials),
-        )
-        .expect_err("all-provider failure should return an error");
-
-        assert_eq!(error, PollError::AuthRequired);
-    }
-
-    #[test]
-    fn antigravity_failure_does_not_block_codex_when_both_are_enabled() {
-        let data = poll_with(
-            false,
-            true,
-            true,
-            || unreachable!("claude code is disabled"),
-            || Ok(usage_with_session_percent(42.0)),
-            || Err(PollError::NoCredentials),
-        )
-        .expect("codex data should keep the poll successful");
-
-        assert!(data.antigravity.is_none());
-        assert_eq!(data.codex.unwrap().session.percentage, 42.0);
     }
 
     #[test]
