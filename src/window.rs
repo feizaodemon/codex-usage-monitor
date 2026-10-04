@@ -2091,13 +2091,13 @@ fn paint_content(
         let _ = SetBkMode(hdc, TRANSPARENT);
         let _ = SetTextColor(hdc, COLORREF(text_color.to_colorref()));
 
-        let font_name = native_interop::wide_str("Segoe UI");
+        let font_name = native_interop::wide_str("Microsoft YaHei UI");
         let font = CreateFontW(
             sc(-12),
             0,
             0,
             0,
-            FW_MEDIUM.0 as i32,
+            FW_NORMAL.0 as i32,
             0,
             0,
             0,
