@@ -1,26 +1,90 @@
 //! Adaptive refresh cadence and honest timestamps for displayed quota data.
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, SystemTime};
+use std::sync::Mutex;
+use std::time::{Duration, Instant, SystemTime};
 
 use crate::models::UsageData;
 use crate::native_interop;
 
 const FAST_INTERVAL_MS: u32 = 60_000;
 const LOW_REMAINING_PERCENT: f64 = 20.0;
-static IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+pub static POLLS: PollGate = PollGate::new();
 
-pub struct PollGuard;
-impl PollGuard {
-    pub fn begin() -> Option<Self> {
-        IN_FLIGHT
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .ok()
-            .map(|_| Self)
+#[derive(Default)]
+struct Pending {
+    running: bool,
+    requested: bool,
+}
+pub struct PollGate(Mutex<Pending>);
+impl PollGate {
+    pub const fn new() -> Self {
+        Self(Mutex::new(Pending {
+            running: false,
+            requested: false,
+        }))
+    }
+    /// Many requests during a poll become one follow-up, without losing a click.
+    pub fn request(&self, queue: bool) -> Option<PollGuard<'_>> {
+        let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if state.running {
+            state.requested |= queue;
+            None
+        } else {
+            state.running = true;
+            Some(PollGuard {
+                gate: self,
+                active: true,
+            })
+        }
     }
 }
-impl Drop for PollGuard {
+pub struct PollGuard<'a> {
+    gate: &'a PollGate,
+    active: bool,
+}
+impl PollGuard<'_> {
+    pub fn next(&mut self) -> bool {
+        let mut state = self.gate.0.lock().unwrap_or_else(|e| e.into_inner());
+        if state.requested {
+            state.requested = false;
+            true
+        } else {
+            // Release ownership under the same lock as the final pending check.
+            state.running = false;
+            self.active = false;
+            false
+        }
+    }
+}
+impl Drop for PollGuard<'_> {
     fn drop(&mut self) {
-        IN_FLIGHT.store(false, Ordering::Release);
+        if self.active {
+            let mut state = self.gate.0.lock().unwrap_or_else(|e| e.into_inner());
+            state.running = false;
+            state.requested = false;
+        }
+    }
+}
+
+/// Limit retries of a reset timestamp that the service keeps returning unchanged.
+#[derive(Default)]
+pub struct ResetRefresh {
+    reset: Option<SystemTime>,
+    started: Option<Instant>,
+}
+impl ResetRefresh {
+    pub fn interval_ms(&mut self, reset: Option<SystemTime>, now: Instant) -> Option<u32> {
+        if self.reset != reset {
+            self.reset = reset;
+            self.started = reset.map(|_| now);
+        }
+        let elapsed = now.saturating_duration_since(self.started?);
+        if elapsed < Duration::from_secs(30) {
+            Some(5_000)
+        } else if elapsed < Duration::from_secs(120) {
+            Some(30_000)
+        } else {
+            None
+        }
     }
 }
 
@@ -96,13 +160,23 @@ impl History {
         let time = native_interop::system_time_to_local(last)
             .map(|t| format!("{:02}:{:02}:{:02}", t.wHour, t.wMinute, t.wSecond))
             .unwrap_or_else(|| "--".into());
+        let cadence = if interval_ms < 60_000 {
+            if chinese {
+                format!("{} 秒", interval_ms / 1000)
+            } else {
+                format!("{} sec", interval_ms / 1000)
+            }
+        } else if chinese {
+            format!("{} 分钟", interval_ms / 60_000)
+        } else {
+            format!("{} min", interval_ms / 60_000)
+        };
         let mut result = if chinese {
             format!(
-                "数字表示剩余额度。\n上次成功更新：{time}（{age} 分钟前）\n当前刷新间隔：{} 分钟。",
-                interval_ms / 60_000
+                "数字表示剩余额度。\n上次成功更新：{time}（{age} 分钟前）\n当前刷新间隔：{cadence}。"
             )
         } else {
-            format!("Numbers indicate quota used.\nLast successful update: {time} ({age} min ago)\nCurrent refresh interval: {} min.", interval_ms / 60_000)
+            format!("Numbers indicate quota used.\nLast successful update: {time} ({age} min ago)\nCurrent refresh interval: {cadence}.")
         };
         if !last_poll_ok {
             result.push_str(if chinese {
@@ -187,9 +261,67 @@ mod tests {
     }
     #[test]
     fn polls_cannot_overlap_and_the_guard_is_released() {
-        let guard = PollGuard::begin().unwrap();
-        assert!(PollGuard::begin().is_none());
+        let gate = PollGate::new();
+        let guard = gate.request(true).unwrap();
+        assert!(gate.request(true).is_none());
         drop(guard);
-        assert!(PollGuard::begin().is_some());
+        assert!(gate.request(true).is_some());
+    }
+    #[test]
+    fn clicks_coalesce_and_finishing_cannot_release_a_new_worker() {
+        let gate = PollGate::new();
+        let mut guard = gate.request(true).unwrap();
+        for _ in 0..100 {
+            assert!(gate.request(true).is_none());
+        }
+        assert!(guard.next());
+        assert!(!guard.next());
+        let next = gate.request(true).unwrap();
+        drop(guard);
+        assert!(gate.request(true).is_none());
+        drop(next);
+        assert!(gate.request(true).is_some());
+    }
+    #[test]
+    fn periodic_ticks_do_not_queue_a_retry_that_bypasses_backoff() {
+        let gate = PollGate::new();
+        let mut guard = gate.request(false).unwrap();
+        assert!(gate.request(false).is_none());
+        assert!(!guard.next());
+    }
+    #[test]
+    fn stale_reset_retries_slow_down_then_stop_until_a_new_window() {
+        let start = Instant::now();
+        let reset = Some(SystemTime::UNIX_EPOCH);
+        let mut refresh = ResetRefresh::default();
+        assert_eq!(refresh.interval_ms(reset, start), Some(5_000));
+        assert_eq!(
+            refresh.interval_ms(reset, start + Duration::from_secs(30)),
+            Some(30_000)
+        );
+        assert_eq!(
+            refresh.interval_ms(reset, start + Duration::from_secs(120)),
+            None
+        );
+        assert_eq!(
+            refresh.interval_ms(reset, start + Duration::from_secs(600)),
+            None
+        );
+        assert_eq!(
+            refresh.interval_ms(None, start + Duration::from_secs(601)),
+            None
+        );
+        assert_eq!(
+            refresh.interval_ms(reset, start + Duration::from_secs(602)),
+            Some(5_000)
+        );
+    }
+    #[test]
+    fn retry_tooltip_reports_seconds_instead_of_zero_minutes() {
+        let mut history = History::default();
+        history.record_success(SystemTime::now(), 60_000);
+        let text = history.description(SystemTime::now(), true, false, 30_000);
+        assert!(text.contains("30 秒"));
+        assert!(!text.contains("0 分钟。"));
     }
 }

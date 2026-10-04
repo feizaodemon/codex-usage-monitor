@@ -9,6 +9,7 @@ mod provider_icons;
 mod quota_refresh;
 mod quota_text;
 mod quota_tooltip;
+mod settings_store;
 mod theme;
 mod tray_icon;
 mod updater;

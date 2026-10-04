@@ -1731,17 +1731,23 @@ fn time_until_display_change_from_secs(total_secs: u64) -> Duration {
     Duration::from_secs(total_secs.saturating_sub(current_bucket_start) + 1)
 }
 
-/// Returns true if either section has reached "now" (reset time has passed).
-pub fn is_past_reset(data: &UsageData) -> bool {
-    let now = SystemTime::now();
-    let past = |s: &UsageSection| matches!(s.resets_at, Some(t) if now.duration_since(t).is_ok());
-    past(&data.session) || past(&data.weekly)
+/// Stable identity of the most recently elapsed quota window.
+pub fn latest_past_reset(data: &AppUsageData, now: SystemTime) -> Option<SystemTime> {
+    [
+        data.claude_code.as_ref(),
+        data.codex.as_ref(),
+        data.antigravity.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    .flat_map(|usage| [usage.session.resets_at, usage.weekly.resets_at])
+    .flatten()
+    .filter(|reset| *reset <= now)
+    .max()
 }
 
 pub fn app_is_past_reset(data: &AppUsageData) -> bool {
-    data.claude_code.as_ref().is_some_and(is_past_reset)
-        || data.codex.as_ref().is_some_and(is_past_reset)
-        || data.antigravity.as_ref().is_some_and(is_past_reset)
+    latest_past_reset(data, SystemTime::now()).is_some()
 }
 
 #[cfg(test)]

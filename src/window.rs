@@ -29,6 +29,7 @@ use crate::provider_icons::{self, Provider};
 use crate::quota_refresh;
 use crate::quota_text;
 use crate::quota_tooltip;
+use crate::settings_store;
 use crate::theme;
 use crate::tray_icon;
 use crate::updater::{self, InstallChannel, ReleaseDescriptor, UpdateCheckResult};
@@ -86,6 +87,7 @@ struct AppState {
     poll_interval_ms: u32,
     adaptive_refresh: bool,
     refresh_history: quota_refresh::History,
+    reset_refresh: quota_refresh::ResetRefresh,
     retry_count: u32,
     force_notify_auth_error: bool,
     auth_error_paused_polling: bool,
@@ -323,7 +325,7 @@ fn legacy_settings_path() -> PathBuf {
     appdata_path(LEGACY_SETTINGS_DIR)
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct SettingsFile {
     #[serde(default)]
     tray_offset: i32,
@@ -459,6 +461,9 @@ fn load_settings_from_paths(
 }
 
 fn normalize_settings(mut settings: SettingsFile) -> SettingsFile {
+    if !(POLL_1_MIN..=POLL_1_HOUR).contains(&settings.poll_interval_ms) {
+        settings.poll_interval_ms = POLL_15_MIN;
+    }
     if !settings.show_claude_code && !settings.show_codex && !settings.show_antigravity {
         settings.show_codex = true;
     }
@@ -474,19 +479,15 @@ fn normalize_settings(mut settings: SettingsFile) -> SettingsFile {
 }
 
 fn save_settings(settings: &SettingsFile) {
-    let path = settings_path();
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    if let Ok(json) = serde_json::to_string_pretty(settings) {
-        let _ = std::fs::write(path, json);
+    if let Err(error) = settings_store::save(&settings_path(), || Some(settings.clone())) {
+        diagnose::log_error("unable to save settings", error);
     }
 }
 
 fn save_state_settings() {
-    let state = lock_state();
-    if let Some(s) = state.as_ref() {
-        save_settings(&SettingsFile {
+    let result = settings_store::save(&settings_path(), || {
+        let state = lock_state();
+        state.as_ref().map(|s| SettingsFile {
             tray_offset: s.tray_offset,
             taskbar_index: s.taskbar_index,
             poll_interval_ms: s.poll_interval_ms,
@@ -503,7 +504,10 @@ fn save_state_settings() {
             show_weekly_window: s.show_weekly_window,
             alert_threshold_percent: s.alert_threshold_percent,
             notified_quota_windows: s.notified_quota_windows.iter().cloned().collect(),
-        });
+        })
+    });
+    if let Err(error) = result {
+        diagnose::log_error("unable to save settings", error);
     }
 }
 
@@ -1732,6 +1736,7 @@ pub fn run() {
                 poll_interval_ms: settings.poll_interval_ms,
                 adaptive_refresh: settings.adaptive_refresh,
                 refresh_history: quota_refresh::History::default(),
+                reset_refresh: quota_refresh::ResetRefresh::default(),
                 retry_count: 0,
                 force_notify_auth_error: false,
                 auth_error_paused_polling: false,
@@ -1802,10 +1807,7 @@ pub fn run() {
 
         // Initial poll
         let send_hwnd = SendHwnd::from_hwnd(hwnd);
-        std::thread::spawn(move || {
-            diagnose::log("initial poll thread started");
-            do_poll(send_hwnd);
-        });
+        request_poll(send_hwnd, false);
 
         schedule_auto_update_check(hwnd);
         let should_check_updates = {
@@ -2344,16 +2346,38 @@ fn poll_error_display_label(error: poller::PollError, language: LanguageId) -> &
     }
 }
 
-fn do_poll(send_hwnd: SendHwnd) {
-    let Some(_guard) = quota_refresh::PollGuard::begin() else {
+fn request_poll(hwnd: SendHwnd, queue: bool) {
+    let Some(mut guard) = quota_refresh::POLLS.request(queue) else {
         return;
     };
+    if let Err(error) = std::thread::Builder::new()
+        .name("quota-poll".into())
+        .spawn(move || loop {
+            do_poll(hwnd);
+            if !guard.next() {
+                break;
+            }
+        })
+    {
+        diagnose::log_error("unable to start quota poll", error);
+    }
+}
+
+fn provider_selection(state: &AppState) -> (bool, bool, bool) {
+    (
+        state.show_claude_code,
+        state.show_codex,
+        state.show_antigravity,
+    )
+}
+
+fn do_poll(send_hwnd: SendHwnd) {
     let hwnd = send_hwnd.to_hwnd();
     let (show_claude_code, show_codex, show_antigravity) = {
         let state = lock_state();
         state
             .as_ref()
-            .map(|s| (s.show_claude_code, s.show_codex, s.show_antigravity))
+            .map(provider_selection)
             .unwrap_or((true, false, false))
     };
 
@@ -2362,6 +2386,9 @@ fn do_poll(send_hwnd: SendHwnd) {
             let mut state = lock_state();
             let mut quota_alerts = Vec::new();
             if let Some(s) = state.as_mut() {
+                if provider_selection(s) != (show_claude_code, show_codex, show_antigravity) {
+                    return;
+                }
                 if let Some(claude_code) = data.claude_code.as_ref() {
                     s.session_percent = claude_code.session.percentage;
                     s.weekly_percent = claude_code.weekly.percentage;
@@ -2452,6 +2479,9 @@ fn do_poll(send_hwnd: SendHwnd) {
                 let mut state = lock_state();
                 let mut should_notify = false;
                 if let Some(s) = state.as_mut() {
+                    if provider_selection(s) != (show_claude_code, show_codex, show_antigravity) {
+                        return;
+                    }
                     s.last_poll_ok = false;
                     match auth_watch {
                         Some((watch_mode, watch_snapshot)) => {
@@ -2549,8 +2579,8 @@ fn do_poll(send_hwnd: SendHwnd) {
 }
 
 fn schedule_countdown_timer() {
-    let state = lock_state();
-    let s = match state.as_ref() {
+    let mut state = lock_state();
+    let s = match state.as_mut() {
         Some(s) => s,
         None => return,
     };
@@ -2569,10 +2599,13 @@ fn schedule_countdown_timer() {
         None => return,
     };
 
-    // If a reset time has passed, poll every 5s to pick up fresh data
-    if poller::app_is_past_reset(data) {
-        unsafe {
-            SetTimer(hwnd, TIMER_RESET_POLL, 5_000, None);
+    let reset = poller::latest_past_reset(data, SystemTime::now());
+    let reset_interval = s.reset_refresh.interval_ms(reset, Instant::now());
+    unsafe {
+        if let Some(interval) = reset_interval {
+            SetTimer(hwnd, TIMER_RESET_POLL, interval, None);
+        } else {
+            let _ = KillTimer(hwnd, TIMER_RESET_POLL);
         }
     }
 
@@ -2879,16 +2912,12 @@ unsafe extern "system" fn wnd_proc(
                                 }
                                 drop(state);
                                 let sh = SendHwnd::from_hwnd(hwnd);
-                                std::thread::spawn(move || {
-                                    do_poll(sh);
-                                });
+                                request_poll(sh, true);
                             }
                         }
                         Some((false, _, _)) => {
                             let sh = SendHwnd::from_hwnd(hwnd);
-                            std::thread::spawn(move || {
-                                do_poll(sh);
-                            });
+                            request_poll(sh, false);
                         }
                         None => {}
                     }
@@ -2900,17 +2929,26 @@ unsafe extern "system" fn wnd_proc(
                 }
                 TIMER_RESET_POLL => {
                     let should_poll = {
-                        let state = lock_state();
+                        let mut state = lock_state();
                         state
-                            .as_ref()
-                            .map(|s| !s.auth_error_paused_polling)
+                            .as_mut()
+                            .map(|s| {
+                                let reset = s.data.as_ref().and_then(|data| {
+                                    poller::latest_past_reset(data, SystemTime::now())
+                                });
+                                let interval = s.reset_refresh.interval_ms(reset, Instant::now());
+                                if let Some(interval) = interval {
+                                    SetTimer(hwnd, TIMER_RESET_POLL, interval, None);
+                                } else {
+                                    let _ = KillTimer(hwnd, TIMER_RESET_POLL);
+                                }
+                                interval.is_some() && s.last_poll_ok && !s.auth_error_paused_polling
+                            })
                             .unwrap_or(false)
                     };
                     if should_poll {
                         let sh = SendHwnd::from_hwnd(hwnd);
-                        std::thread::spawn(move || {
-                            do_poll(sh);
-                        });
+                        request_poll(sh, false);
                     }
                 }
                 TIMER_FRESHNESS => {
@@ -3133,9 +3171,7 @@ unsafe extern "system" fn wnd_proc(
                     }
                     render_layered();
                     let sh = SendHwnd::from_hwnd(hwnd);
-                    std::thread::spawn(move || {
-                        do_poll(sh);
-                    });
+                    request_poll(sh, true);
                 }
                 IDM_VERSION_ACTION => {
                     let (install_channel, release) = {
@@ -3318,9 +3354,7 @@ unsafe extern "system" fn wnd_proc(
                     render_layered();
                     sync_tray_icons(hwnd);
                     let sh = SendHwnd::from_hwnd(hwnd);
-                    std::thread::spawn(move || {
-                        do_poll(sh);
-                    });
+                    request_poll(sh, true);
                 }
                 IDM_LANG_SYSTEM
                 | IDM_LANG_ENGLISH
@@ -4269,6 +4303,17 @@ mod tests {
             poll_error_display_label(poller::PollError::RequestFailed, LanguageId::English),
             "ERR"
         );
+    }
+
+    #[test]
+    fn invalid_poll_intervals_cannot_create_a_busy_timer() {
+        for interval in [0, 1, u32::MAX] {
+            let settings = normalize_settings(SettingsFile {
+                poll_interval_ms: interval,
+                ..SettingsFile::default()
+            });
+            assert_eq!(settings.poll_interval_ms, POLL_15_MIN);
+        }
     }
 
     #[test]
