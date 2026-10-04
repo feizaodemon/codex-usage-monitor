@@ -1657,20 +1657,17 @@ fn format_simplified_chinese_values(
     window: UsageWindowKind,
 ) -> String {
     let Some(reset) = reset else {
-        return format!("剩余{remaining:.0}%");
+        return format!("{remaining:.0}%");
     };
     match window {
         UsageWindowKind::Session => {
             format!(
-                "剩余{remaining:.0}%  {:02}:{:02}重置",
+                "{remaining:.0}%  {:02}:{:02}重置",
                 reset.wHour, reset.wMinute
             )
         }
         UsageWindowKind::Weekly => {
-            format!(
-                "剩余{remaining:.0}%  {:02}/{:02}重置",
-                reset.wMonth, reset.wDay
-            )
+            format!("{remaining:.0}%  {:02}/{:02}重置", reset.wMonth, reset.wDay)
         }
     }
 }
@@ -1864,7 +1861,7 @@ mod tests {
         let strings = crate::localization::LanguageId::SimplifiedChinese.strings();
         assert!(
             format_codex_line(&usage.session, strings, true, UsageWindowKind::Session)
-                .starts_with("剩余100%")
+                .starts_with("100%")
         );
         assert_eq!(
             format_codex_line(&usage.weekly, strings, true, UsageWindowKind::Weekly),
@@ -1897,7 +1894,7 @@ mod tests {
         };
         assert_eq!(
             format_line(&section, strings, true, UsageWindowKind::Session),
-            "剩余70%"
+            "70%"
         );
         let session_reset = windows::Win32::Foundation::SYSTEMTIME {
             wHour: 18,
@@ -1906,7 +1903,7 @@ mod tests {
         };
         assert_eq!(
             format_simplified_chinese_values(82.0, Some(session_reset), UsageWindowKind::Session,),
-            "剩余82%  18:30重置"
+            "82%  18:30重置"
         );
         let weekly_reset = windows::Win32::Foundation::SYSTEMTIME {
             wMonth: 7,
@@ -1915,7 +1912,7 @@ mod tests {
         };
         assert_eq!(
             format_simplified_chinese_values(97.0, Some(weekly_reset), UsageWindowKind::Weekly,),
-            "剩余97%  07/17重置"
+            "97%  07/17重置"
         );
     }
 
