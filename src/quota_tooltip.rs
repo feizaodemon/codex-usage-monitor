@@ -1,4 +1,4 @@
-//! Native tooltips for reported-but-unavailable Codex quota windows.
+//! Native tooltips for freshness, update failures and unavailable quota windows.
 use std::sync::Mutex;
 
 use windows::core::{w, PWSTR};
@@ -38,9 +38,9 @@ pub fn message(chinese: bool, weekly: bool) -> &'static str {
     }
 }
 
-/// Called on the UI thread after an actual successful usage response. Rects
+/// Called on the UI thread as displayed data and freshness change. Rects
 /// are widget-client coordinates, so the tips also work when it is dragged.
-pub fn sync(owner: HWND, regions: Vec<(RECT, &'static str)>) {
+pub fn sync(owner: HWND, regions: Vec<(RECT, String)>) {
     let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
     let key = regions
         .iter()
@@ -166,14 +166,17 @@ mod tests {
             };
             sync(
                 owner,
-                vec![(rect, message(true, false)), (rect, message(true, true))],
+                vec![
+                    (rect, message(true, false).into()),
+                    (rect, message(true, true).into()),
+                ],
             );
             let tooltip = HWND(STATE.lock().unwrap().window as *mut _);
             assert_eq!(
                 SendMessageW(tooltip, TTM_GETTOOLCOUNT, WPARAM(0), LPARAM(0)).0,
                 2
             );
-            sync(owner, vec![(rect, message(false, false))]);
+            sync(owner, vec![(rect, message(false, false).into())]);
             assert_eq!(
                 SendMessageW(tooltip, TTM_GETTOOLCOUNT, WPARAM(0), LPARAM(0)).0,
                 1

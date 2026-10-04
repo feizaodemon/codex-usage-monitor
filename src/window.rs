@@ -21,11 +21,12 @@ use crate::diagnose;
 use crate::localization::{self, LanguageId, Strings};
 use crate::models::AppUsageData;
 use crate::native_interop::{
-    self, Color, TIMER_COUNTDOWN, TIMER_POLL, TIMER_RESET_POLL, TIMER_UPDATE_CHECK, WM_APP_TRAY,
-    WM_APP_USAGE_UPDATED,
+    self, Color, TIMER_COUNTDOWN, TIMER_FRESHNESS, TIMER_POLL, TIMER_RESET_POLL,
+    TIMER_UPDATE_CHECK, WM_APP_TRAY, WM_APP_USAGE_UPDATED,
 };
 use crate::poller;
 use crate::provider_icons::{self, Provider};
+use crate::quota_refresh;
 use crate::quota_text;
 use crate::quota_tooltip;
 use crate::theme;
@@ -83,6 +84,8 @@ struct AppState {
     data: Option<AppUsageData>,
 
     poll_interval_ms: u32,
+    adaptive_refresh: bool,
+    refresh_history: quota_refresh::History,
     retry_count: u32,
     force_notify_auth_error: bool,
     auth_error_paused_polling: bool,
@@ -111,8 +114,6 @@ enum UpdateStatus {
     Available(ReleaseDescriptor),
 }
 
-const RETRY_BASE_MS: u32 = 30_000; // 30 seconds
-
 const POLL_1_MIN: u32 = 60_000;
 const POLL_5_MIN: u32 = 300_000;
 const POLL_15_MIN: u32 = 900_000;
@@ -123,6 +124,7 @@ const IDM_FREQ_1MIN: u16 = 10;
 const IDM_FREQ_5MIN: u16 = 11;
 const IDM_FREQ_15MIN: u16 = 12;
 const IDM_FREQ_1HOUR: u16 = 13;
+const IDM_ADAPTIVE_REFRESH: u16 = 14;
 const IDM_START_WITH_WINDOWS: u16 = 20;
 const IDM_RESET_POSITION: u16 = 30;
 const IDM_VERSION_ACTION: u16 = 31;
@@ -329,6 +331,8 @@ struct SettingsFile {
     taskbar_index: usize,
     #[serde(default = "default_poll_interval")]
     poll_interval_ms: u32,
+    #[serde(default = "default_adaptive_refresh")]
+    adaptive_refresh: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     language: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -357,6 +361,7 @@ impl Default for SettingsFile {
             tray_offset: 0,
             taskbar_index: 0,
             poll_interval_ms: default_poll_interval(),
+            adaptive_refresh: true,
             language: None,
             last_update_check_unix: None,
             widget_visible: true,
@@ -369,6 +374,10 @@ impl Default for SettingsFile {
             notified_quota_windows: Vec::new(),
         }
     }
+}
+
+fn default_adaptive_refresh() -> bool {
+    true
 }
 
 fn default_poll_interval() -> u32 {
@@ -481,6 +490,7 @@ fn save_state_settings() {
             tray_offset: s.tray_offset,
             taskbar_index: s.taskbar_index,
             poll_interval_ms: s.poll_interval_ms,
+            adaptive_refresh: s.adaptive_refresh,
             language: s
                 .language_override
                 .map(|language| language.code().to_string()),
@@ -915,6 +925,19 @@ fn schedule_auto_update_check(hwnd: HWND) {
     }
 }
 
+fn effective_poll_interval(state: &AppState) -> u32 {
+    let providers = state.data.iter().flat_map(|d| {
+        [
+            d.claude_code.as_ref().filter(|_| state.show_claude_code),
+            d.codex.as_ref().filter(|_| state.show_codex),
+            d.antigravity.as_ref().filter(|_| state.show_antigravity),
+        ]
+        .into_iter()
+        .flatten()
+    });
+    quota_refresh::interval_ms(state.poll_interval_ms, state.adaptive_refresh, providers)
+}
+
 fn refresh_usage_texts(state: &mut AppState) {
     if !state.last_poll_ok {
         return;
@@ -983,6 +1006,17 @@ fn refresh_usage_texts(state: &mut AppState) {
     } else if state.show_antigravity {
         state.antigravity_session_text = "!".to_string();
         state.antigravity_weekly_text = "!".to_string();
+    }
+    let stale = state.refresh_history.is_stale(SystemTime::now());
+    for text in [
+        &mut state.session_text,
+        &mut state.weekly_text,
+        &mut state.codex_session_text,
+        &mut state.codex_weekly_text,
+        &mut state.antigravity_session_text,
+        &mut state.antigravity_weekly_text,
+    ] {
+        quota_refresh::mark_stale(text, stale);
     }
 }
 
@@ -1696,6 +1730,8 @@ pub fn run() {
                 notified_quota_windows: settings.notified_quota_windows.into_iter().collect(),
                 data: None,
                 poll_interval_ms: settings.poll_interval_ms,
+                adaptive_refresh: settings.adaptive_refresh,
+                refresh_history: quota_refresh::History::default(),
                 retry_count: 0,
                 force_notify_auth_error: false,
                 auth_error_paused_polling: false,
@@ -1755,6 +1791,7 @@ pub fn run() {
                 .unwrap_or(POLL_15_MIN)
         };
         SetTimer(hwnd, TIMER_POLL, initial_poll_ms, None);
+        SetTimer(hwnd, TIMER_FRESHNESS, 30_000, None);
 
         // Watch for explorer.exe restarts so we can re-embed and re-add the tray
         // icon (the shell discards tray registrations when it restarts). This
@@ -1800,48 +1837,74 @@ fn update_quota_tooltips() {
         let state = lock_state();
         let Some(s) = state.as_ref() else { return };
         let mut regions = Vec::new();
-        if s.last_poll_ok && s.show_codex && !s.dragging {
+        if !s.dragging {
+            let chinese = s.language == LanguageId::SimplifiedChinese;
             let count = active_model_count(s.show_claude_code, s.show_codex, s.show_antigravity);
             let (label_width, text_width) = usage_layout_widths(s.language);
-            let model_width = model_usage_width(row_bar_segment_count(count), text_width);
-            let left = sc(LEFT_DIVIDER_W)
+            let width = model_usage_width(row_bar_segment_count(count), text_width);
+            let mut left = sc(LEFT_DIVIDER_W)
                 + sc(DIVIDER_RIGHT_MARGIN)
                 + sc(label_width)
-                + sc(LABEL_RIGHT_MARGIN)
-                + if s.show_claude_code {
-                    model_width + sc(MODEL_RIGHT_MARGIN)
+                + sc(LABEL_RIGHT_MARGIN);
+            let description = s.refresh_history.description(
+                SystemTime::now(),
+                chinese,
+                s.last_poll_ok,
+                if s.retry_count > 0 && !s.auth_error_paused_polling {
+                    quota_refresh::retry_interval_ms(s.poll_interval_ms, s.retry_count)
                 } else {
-                    0
-                };
-            let height = sc(WIDGET_HEIGHT);
-            let row2 = height - sc(5) - sc(SEGMENT_H);
-            let row1 = row2 - sc(10) - sc(SEGMENT_H);
-            let single = (height - sc(SEGMENT_H)) / 2;
-            for (visible, missing, y, weekly) in [
+                    effective_poll_interval(s)
+                },
+            );
+            for (visible, name, session, weekly) in [
                 (
-                    s.show_session_window,
-                    s.codex_session_text == "--",
-                    if s.show_weekly_window { row1 } else { single },
-                    false,
+                    s.show_claude_code,
+                    "Claude Code",
+                    &s.session_text,
+                    &s.weekly_text,
                 ),
                 (
-                    s.show_weekly_window,
-                    s.codex_weekly_text == "--",
-                    if s.show_session_window { row2 } else { single },
-                    true,
+                    s.show_codex,
+                    "Codex",
+                    &s.codex_session_text,
+                    &s.codex_weekly_text,
+                ),
+                (
+                    s.show_antigravity,
+                    "Antigravity",
+                    &s.antigravity_session_text,
+                    &s.antigravity_weekly_text,
                 ),
             ] {
-                if visible && missing {
-                    regions.push((
-                        RECT {
-                            left,
-                            top: y - sc(3),
-                            right: left + model_width,
-                            bottom: y + sc(SEGMENT_H + 3),
-                        },
-                        quota_tooltip::message(s.language == LanguageId::SimplifiedChinese, weekly),
-                    ));
+                if !visible {
+                    continue;
                 }
+                let mut text = format!("{name}\n{description}");
+                if s.last_poll_ok && session == "!" {
+                    text.push_str(if chinese {
+                        "\n本服务本次未返回额度。"
+                    } else {
+                        "\nThis provider did not return quota in the latest update."
+                    });
+                }
+                if name == "Codex" && s.last_poll_ok {
+                    for (missing, is_weekly) in [(session == "--", false), (weekly == "--", true)] {
+                        if missing {
+                            text.push('\n');
+                            text.push_str(quota_tooltip::message(chinese, is_weekly));
+                        }
+                    }
+                }
+                regions.push((
+                    RECT {
+                        left,
+                        top: 0,
+                        right: left + width,
+                        bottom: sc(WIDGET_HEIGHT),
+                    },
+                    text,
+                ));
+                left += width + sc(MODEL_RIGHT_MARGIN);
             }
         }
         (s.hwnd.to_hwnd(), regions)
@@ -1849,9 +1912,7 @@ fn update_quota_tooltips() {
     quota_tooltip::sync(hwnd, regions);
 }
 
-/// Render widget content and push to the layered window via UpdateLayeredWindow.
-/// Renders fully opaque with the actual taskbar background colour so that
-/// ClearType sub-pixel font rendering can be used for crisp, OS-native text.
+/// Render opaque taskbar content with ClearType via UpdateLayeredWindow.
 fn render_layered() {
     refresh_dpi();
     update_quota_tooltips();
@@ -2284,6 +2345,9 @@ fn poll_error_display_label(error: poller::PollError, language: LanguageId) -> &
 }
 
 fn do_poll(send_hwnd: SendHwnd) {
+    let Some(_guard) = quota_refresh::PollGuard::begin() else {
+        return;
+    };
     let hwnd = send_hwnd.to_hwnd();
     let (show_claude_code, show_codex, show_antigravity) = {
         let state = lock_state();
@@ -2329,15 +2393,14 @@ fn do_poll(send_hwnd: SendHwnd) {
                 quota_alerts = collect_low_quota_alerts(s, &data);
                 s.data = Some(data);
                 s.last_poll_ok = true;
+                let interval = effective_poll_interval(s);
+                diagnose::log(format!("usage poll succeeded interval_ms={interval}"));
+                s.refresh_history
+                    .record_success(SystemTime::now(), interval);
                 refresh_usage_texts(s);
-
-                // Recovered from errors — restore normal poll interval
-                if s.retry_count > 0 {
-                    s.retry_count = 0;
-                    let interval = s.poll_interval_ms;
-                    unsafe {
-                        SetTimer(hwnd, TIMER_POLL, interval, None);
-                    }
+                s.retry_count = 0;
+                unsafe {
+                    SetTimer(hwnd, TIMER_POLL, interval, None);
                 }
                 s.force_notify_auth_error = false;
                 s.auth_error_paused_polling = false;
@@ -2428,10 +2491,8 @@ fn do_poll(send_hwnd: SendHwnd) {
                             s.antigravity_session_text = label.clone();
                             s.antigravity_weekly_text = label;
                             s.retry_count = s.retry_count.saturating_add(1);
-                            let backoff = RETRY_BASE_MS.saturating_mul(
-                                1u32.checked_shl(s.retry_count - 1).unwrap_or(u32::MAX),
-                            );
-                            let retry_ms = backoff.min(s.poll_interval_ms);
+                            let retry_ms =
+                                quota_refresh::retry_interval_ms(s.poll_interval_ms, s.retry_count);
                             diagnose::log(format!(
                                 "usage poll failed category={} retry={} retry_ms={retry_ms}",
                                 e.category(),
@@ -2852,6 +2913,10 @@ unsafe extern "system" fn wnd_proc(
                         });
                     }
                 }
+                TIMER_FRESHNESS => {
+                    update_display();
+                    render_layered();
+                }
                 TIMER_UPDATE_CHECK => {
                     begin_update_check(hwnd, false);
                 }
@@ -3139,11 +3204,29 @@ unsafe extern "system" fn wnd_proc(
                         let mut state = lock_state();
                         if let Some(s) = state.as_mut() {
                             s.poll_interval_ms = new_interval;
+                            if s.last_poll_ok {
+                                let interval = effective_poll_interval(s);
+                                s.refresh_history.expected_interval_ms = interval;
+                                SetTimer(hwnd, TIMER_POLL, interval, None);
+                            }
                         }
                     }
                     save_state_settings();
-                    // Reset the poll timer with the new interval
-                    SetTimer(hwnd, TIMER_POLL, new_interval, None);
+                }
+                IDM_ADAPTIVE_REFRESH => {
+                    {
+                        let mut state = lock_state();
+                        if let Some(s) = state.as_mut() {
+                            s.adaptive_refresh = !s.adaptive_refresh;
+                            if s.last_poll_ok {
+                                let interval = effective_poll_interval(s);
+                                s.refresh_history.expected_interval_ms = interval;
+                                SetTimer(hwnd, TIMER_POLL, interval, None);
+                            }
+                        }
+                    }
+                    save_state_settings();
+                    render_layered();
                 }
                 IDM_SHOW_SESSION_WINDOW | IDM_SHOW_WEEKLY_WINDOW => {
                     {
@@ -3399,6 +3482,24 @@ fn show_context_menu(hwnd: HWND) {
             );
         }
 
+        let adaptive = lock_state().as_ref().is_some_and(|s| s.adaptive_refresh);
+        let adaptive_label =
+            native_interop::wide_str(if language == LanguageId::SimplifiedChinese {
+                "剩余 ≤20% 时每分钟刷新"
+            } else {
+                "Refresh every minute when remaining ≤20%"
+            });
+        let _ = AppendMenuW(freq_menu, MF_SEPARATOR, 0, PCWSTR::null());
+        let _ = AppendMenuW(
+            freq_menu,
+            if adaptive {
+                MF_CHECKED
+            } else {
+                MENU_ITEM_FLAGS(0)
+            },
+            IDM_ADAPTIVE_REFRESH as usize,
+            PCWSTR::from_raw(adaptive_label.as_ptr()),
+        );
         let freq_label = native_interop::wide_str(strings.update_frequency);
         let _ = AppendMenuW(
             menu,
