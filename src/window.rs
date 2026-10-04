@@ -1419,7 +1419,7 @@ const LABEL_RIGHT_MARGIN: i32 = 10;
 const BAR_RIGHT_MARGIN: i32 = 4;
 const TEXT_WIDTH: i32 = 62;
 const SIMPLIFIED_CHINESE_LABEL_WIDTH: i32 = 20;
-const SIMPLIFIED_CHINESE_TEXT_WIDTH: i32 = 126;
+const SIMPLIFIED_CHINESE_TEXT_WIDTH: i32 = 138;
 const MODEL_RIGHT_MARGIN: i32 = 3;
 const RIGHT_MARGIN: i32 = 1;
 const WIDGET_HEIGHT: i32 = 46;
@@ -2097,7 +2097,7 @@ fn paint_content(
             0,
             0,
             0,
-            FW_NORMAL.0 as i32,
+            FW_SEMIBOLD.0 as i32,
             0,
             0,
             0,
