@@ -26,6 +26,8 @@ use crate::native_interop::{
 };
 use crate::poller;
 use crate::provider_icons::{self, Provider};
+use crate::quota_text;
+use crate::quota_tooltip;
 use crate::theme;
 use crate::tray_icon;
 use crate::updater::{self, InstallChannel, ReleaseDescriptor, UpdateCheckResult};
@@ -1417,7 +1419,7 @@ const DIVIDER_RIGHT_MARGIN: i32 = 10;
 const LABEL_WIDTH: i32 = 18;
 const LABEL_RIGHT_MARGIN: i32 = 10;
 const BAR_RIGHT_MARGIN: i32 = 4;
-const TEXT_WIDTH: i32 = 62;
+const TEXT_WIDTH: i32 = 110;
 const SIMPLIFIED_CHINESE_LABEL_WIDTH: i32 = 20;
 const SIMPLIFIED_CHINESE_TEXT_WIDTH: i32 = 138;
 const MODEL_RIGHT_MARGIN: i32 = 3;
@@ -1792,11 +1794,67 @@ pub fn run() {
     }
 }
 
+/// Keep missing-window explanations aligned with the Codex quota cells.
+fn update_quota_tooltips() {
+    let (hwnd, regions) = {
+        let state = lock_state();
+        let Some(s) = state.as_ref() else { return };
+        let mut regions = Vec::new();
+        if s.last_poll_ok && s.show_codex && !s.dragging {
+            let count = active_model_count(s.show_claude_code, s.show_codex, s.show_antigravity);
+            let (label_width, text_width) = usage_layout_widths(s.language);
+            let model_width = model_usage_width(row_bar_segment_count(count), text_width);
+            let left = sc(LEFT_DIVIDER_W)
+                + sc(DIVIDER_RIGHT_MARGIN)
+                + sc(label_width)
+                + sc(LABEL_RIGHT_MARGIN)
+                + if s.show_claude_code {
+                    model_width + sc(MODEL_RIGHT_MARGIN)
+                } else {
+                    0
+                };
+            let height = sc(WIDGET_HEIGHT);
+            let row2 = height - sc(5) - sc(SEGMENT_H);
+            let row1 = row2 - sc(10) - sc(SEGMENT_H);
+            let single = (height - sc(SEGMENT_H)) / 2;
+            for (visible, missing, y, weekly) in [
+                (
+                    s.show_session_window,
+                    s.codex_session_text == "--",
+                    if s.show_weekly_window { row1 } else { single },
+                    false,
+                ),
+                (
+                    s.show_weekly_window,
+                    s.codex_weekly_text == "--",
+                    if s.show_session_window { row2 } else { single },
+                    true,
+                ),
+            ] {
+                if visible && missing {
+                    regions.push((
+                        RECT {
+                            left,
+                            top: y - sc(3),
+                            right: left + model_width,
+                            bottom: y + sc(SEGMENT_H + 3),
+                        },
+                        quota_tooltip::message(s.language == LanguageId::SimplifiedChinese, weekly),
+                    ));
+                }
+            }
+        }
+        (s.hwnd.to_hwnd(), regions)
+    };
+    quota_tooltip::sync(hwnd, regions);
+}
+
 /// Render widget content and push to the layered window via UpdateLayeredWindow.
 /// Renders fully opaque with the actual taskbar background colour so that
 /// ClearType sub-pixel font rendering can be used for crisp, OS-native text.
 fn render_layered() {
     refresh_dpi();
+    update_quota_tooltips();
     let (
         hwnd_val,
         is_dark,
@@ -3237,6 +3295,7 @@ unsafe extern "system" fn wnd_proc(
             LRESULT(0)
         }
         WM_DESTROY => {
+            quota_tooltip::clear();
             let hook = {
                 let state = lock_state();
                 state.as_ref().and_then(|s| s.win_event_hook)
@@ -3839,6 +3898,7 @@ fn draw_row(
                 track,
                 &claude_value_color,
                 text_width,
+                is_dark,
             );
             model_x += model_usage_width(segment_count, text_width) + sc(MODEL_RIGHT_MARGIN);
         }
@@ -3854,6 +3914,7 @@ fn draw_row(
                 track,
                 &codex_value_color,
                 text_width,
+                is_dark,
             );
             model_x += model_usage_width(segment_count, text_width) + sc(MODEL_RIGHT_MARGIN);
         }
@@ -3869,6 +3930,7 @@ fn draw_row(
                 track,
                 &antigravity_value_color,
                 text_width,
+                is_dark,
             );
         }
     }
@@ -3901,6 +3963,7 @@ fn draw_usage_bar(
     track: &Color,
     text_color: &Color,
     text_width: i32,
+    is_dark: bool,
 ) {
     let seg_w = sc(SEGMENT_W);
     let seg_h = sc(SEGMENT_H);
@@ -3943,19 +4006,8 @@ fn draw_usage_bar(
         }
 
         let text_x = bar_x + bar_width + sc(BAR_RIGHT_MARGIN);
-        let mut text_wide: Vec<u16> = text.encode_utf16().collect();
-        let mut text_rect = RECT {
-            left: text_x,
-            top: y,
-            right: text_x + sc(text_width),
-            bottom: y + seg_h,
-        };
-        let _ = SetTextColor(hdc, COLORREF(text_color.to_colorref()));
-        let _ = DrawTextW(
-            hdc,
-            &mut text_wide,
-            &mut text_rect,
-            DT_LEFT | DT_VCENTER | DT_SINGLELINE,
+        quota_text::draw(
+            hdc, text_x, y, seg_h, text_width, text, text_color, is_dark, sc,
         );
     }
 }
