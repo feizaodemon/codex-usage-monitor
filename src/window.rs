@@ -942,13 +942,13 @@ fn refresh_usage_texts(state: &mut AppState) {
     }
 
     if let Some(codex) = data.codex.as_ref() {
-        state.codex_session_text = poller::format_line(
+        state.codex_session_text = poller::format_codex_line(
             &codex.session,
             strings,
             show_remaining,
             poller::UsageWindowKind::Session,
         );
-        state.codex_weekly_text = poller::format_line(
+        state.codex_weekly_text = poller::format_codex_line(
             &codex.weekly,
             strings,
             show_remaining,
@@ -3886,6 +3886,14 @@ fn model_usage_width(segment_count: i32, text_width: i32) -> i32 {
         + sc(text_width)
 }
 
+fn usage_bar_fill_percentage(percent: f64, text: &str) -> f64 {
+    if text == "--" {
+        0.0
+    } else {
+        percent.clamp(0.0, 100.0)
+    }
+}
+
 fn draw_usage_bar(
     hdc: HDC,
     bar_x: i32,
@@ -3905,7 +3913,7 @@ fn draw_usage_bar(
     let corner_r = seg_h / 2;
 
     unsafe {
-        let percent_clamped = percent.clamp(0.0, 100.0);
+        let percent_clamped = usage_bar_fill_percentage(percent, text);
         let bar_rect = RECT {
             left: bar_x,
             top: y,
@@ -3976,6 +3984,13 @@ fn draw_rounded_rect(hdc: HDC, rect: &RECT, color: &Color, radius: i32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unavailable_quota_has_no_bar_fill() {
+        assert_eq!(usage_bar_fill_percentage(100.0, "--"), 0.0);
+        assert_eq!(usage_bar_fill_percentage(61.0, "剩余61%"), 61.0);
+        assert_eq!(usage_bar_fill_percentage(100.0, "剩余100%"), 100.0);
+    }
 
     #[test]
     fn service_tooltip_combines_visible_quota_rows() {

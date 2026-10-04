@@ -1609,6 +1609,20 @@ fn is_leap(y: u64) -> bool {
     (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
 }
 
+/// Codex leaves absent windows as default sections. Its reported windows
+/// include a reset timestamp, including windows with zero usage.
+pub fn format_codex_line(
+    section: &UsageSection,
+    strings: Strings,
+    show_remaining_in_chinese: bool,
+    window: UsageWindowKind,
+) -> String {
+    if section.percentage == 0.0 && section.resets_at.is_none() {
+        return "--".to_string();
+    }
+    format_line(section, strings, show_remaining_in_chinese, window)
+}
+
 /// Format a usage section for the compact taskbar display.
 pub fn format_line(
     section: &UsageSection,
@@ -1791,6 +1805,20 @@ mod tests {
         assert!(usage.session.resets_at.is_none());
         assert_eq!(usage.weekly.percentage, 21.0);
         assert!(usage.weekly.resets_at.is_some());
+        for language in [
+            crate::localization::LanguageId::SimplifiedChinese,
+            crate::localization::LanguageId::English,
+        ] {
+            assert_eq!(
+                format_codex_line(
+                    &usage.session,
+                    language.strings(),
+                    language == crate::localization::LanguageId::SimplifiedChinese,
+                    UsageWindowKind::Session,
+                ),
+                "--"
+            );
+        }
     }
 
     #[test]
@@ -1815,6 +1843,33 @@ mod tests {
 
         assert_eq!(usage.session.percentage, 18.0);
         assert_eq!(usage.weekly.percentage, 33.0);
+    }
+
+    #[test]
+    fn codex_session_only_zero_usage_keeps_real_quota_visible() {
+        let response: CodexUsageResponse = serde_json::from_str(
+            r#"{
+                "rate_limit": {
+                    "primary_window": {
+                        "used_percent": 0,
+                        "limit_window_seconds": 18000,
+                        "reset_at": 1784500338
+                    },
+                    "secondary_window": null
+                }
+            }"#,
+        )
+        .unwrap();
+        let usage = codex_usage_from_response(response).unwrap();
+        let strings = crate::localization::LanguageId::SimplifiedChinese.strings();
+        assert!(
+            format_codex_line(&usage.session, strings, true, UsageWindowKind::Session)
+                .starts_with("剩余100%")
+        );
+        assert_eq!(
+            format_codex_line(&usage.weekly, strings, true, UsageWindowKind::Weekly),
+            "--"
+        );
     }
 
     #[test]
