@@ -17,6 +17,7 @@ pub struct Service {
     forced: bool,
     retries: u32,
     due: Instant,
+    retry_not_before: Option<Instant>,
     auth: Option<(CredentialWatchMode, CredentialWatchSnapshot)>,
     reset: ResetRefresh,
 }
@@ -150,6 +151,7 @@ impl Monitor {
                 forced: false,
                 retries: 0,
                 due: now,
+                retry_not_before: None,
                 auth: None,
                 reset: ResetRefresh::default(),
             }),
@@ -160,14 +162,18 @@ impl Monitor {
             if service.enabled != enabled {
                 service.enabled = enabled;
                 service.generation = service.generation.wrapping_add(1);
-                service.due = now;
+                service.due = service
+                    .retry_not_before
+                    .map_or(now, |deadline| deadline.max(now));
                 service.forced = enabled;
             }
         }
     }
     pub fn force(&mut self, now: Instant, include_auth: bool) {
         for service in self.services.iter_mut().filter(|s| s.enabled) {
-            service.due = now;
+            service.due = service
+                .retry_not_before
+                .map_or(now, |deadline| deadline.max(now));
             service.forced |= include_auth || service.auth.is_none();
         }
     }
@@ -205,6 +211,12 @@ impl Monitor {
         let owns_request = s.in_flight == Some(job.ticket);
         if owns_request {
             s.in_flight = None;
+            // A hidden/obsolete response still carries a server wait deadline.
+            if let Some(Err(PollError::RateLimited(Some(ms)))) = attempt.result {
+                let deadline = now + Duration::from_millis(ms as u64);
+                s.retry_not_before = Some(deadline);
+                s.due = s.due.max(deadline);
+            }
         }
         if !owns_request || !s.enabled || s.generation != job.generation {
             return Completion {
@@ -221,6 +233,7 @@ impl Monitor {
                 s.retries = 0;
                 s.error = None;
                 s.auth = None;
+                s.retry_not_before = None;
                 let reset = [data.session.resets_at, data.weekly.resets_at]
                     .into_iter()
                     .flatten()
@@ -241,7 +254,15 @@ impl Monitor {
                 s.error = Some(error);
                 s.retries = s.retries.saturating_add(1);
                 s.auth = attempt.auth;
-                s.interval_ms = if s.auth.is_some() {
+                s.retry_not_before = match error {
+                    PollError::RateLimited(Some(ms)) => {
+                        Some(now + Duration::from_millis(ms as u64))
+                    }
+                    _ => None,
+                };
+                s.interval_ms = if let PollError::RateLimited(Some(ms)) = error {
+                    ms
+                } else if s.auth.is_some() {
                     base
                 } else {
                     quota_refresh::retry_interval_ms(base, s.retries)
@@ -252,7 +273,7 @@ impl Monitor {
             }
         }
         s.due = if s.forced {
-            now
+            s.retry_not_before.map_or(now, |deadline| deadline.max(now))
         } else {
             now + Duration::from_millis(s.interval_ms as u64)
         };
@@ -309,10 +330,44 @@ impl Service {
     pub fn stale(&self, now: SystemTime) -> bool {
         self.error.is_some() || self.history.is_stale(now)
     }
-    pub fn description(&self, now: SystemTime, chinese: bool) -> String {
+    pub fn description(&self, now: SystemTime, clock: Instant, chinese: bool) -> String {
         let mut text =
             self.history
                 .description(now, chinese, self.error.is_none(), self.interval_ms);
+        if self.in_flight.is_some() {
+            text.push_str(if chinese {
+                "\n正在刷新…"
+            } else {
+                "\nRefreshing…"
+            });
+        } else if self.enabled {
+            let delay = self.due.saturating_duration_since(clock);
+            let time = now
+                .checked_add(delay)
+                .and_then(crate::native_interop::system_time_to_local)
+                .map(|t| format!("{:02}:{:02}:{:02}", t.wHour, t.wMinute, t.wSecond))
+                .unwrap_or_else(|| "--".into());
+            let label = if self.auth.is_some() {
+                if chinese {
+                    "下次检查登录凭据"
+                } else {
+                    "Next credential check"
+                }
+            } else if self.error.is_some() {
+                if chinese {
+                    "下次重试"
+                } else {
+                    "Next retry"
+                }
+            } else {
+                if chinese {
+                    "下次刷新"
+                } else {
+                    "Next refresh"
+                }
+            };
+            text.push_str(&format!("\n{label}：{time}"));
+        }
         if let Some(error) = self.error {
             let reason = if chinese {
                 match error {
@@ -320,7 +375,7 @@ impl Service {
                     PollError::NoCredentials => "未找到登录凭据",
                     PollError::TokenExpired => "登录已过期",
                     PollError::NetworkUnavailable => "网络连接失败",
-                    PollError::RateLimited => "请求过于频繁，正在退避",
+                    PollError::RateLimited(_) => "请求过于频繁，正在退避",
                     PollError::ServerError => "服务暂时不可用",
                     PollError::RequestFailed => "无法读取额度响应",
                 }
@@ -352,6 +407,95 @@ impl Service {
 mod tests {
     use super::*;
     use std::sync::{mpsc, Mutex};
+
+    #[test]
+    fn server_retry_deadline_survives_manual_refresh_and_selection_changes() {
+        let now = Instant::now();
+        let wall = SystemTime::now();
+        let mut monitor = Monitor::new([true, true, false], now);
+        let jobs = monitor.plan(now);
+        monitor.force(now, true); // A click during the request must also wait.
+        complete(
+            &mut monitor,
+            &jobs[0],
+            Err(PollError::RateLimited(Some(1_800_000))),
+            now,
+            wall,
+        );
+        complete(&mut monitor, &jobs[1], Ok(usage(20.0)), now, wall);
+        assert_eq!(monitor.services[0].interval_ms, 1_800_000);
+        let follow_up = monitor.plan(now);
+        assert_eq!(follow_up.len(), 1);
+        assert_eq!(follow_up[0].id, 1);
+        complete(&mut monitor, &follow_up[0], Ok(usage(20.0)), now, wall);
+        monitor.force(now, true);
+        monitor.configure([false, true, false], now);
+        monitor.configure([true, true, false], now);
+        assert!(monitor.plan(now).iter().all(|job| job.id != 0));
+        let due = now + Duration::from_secs(1800);
+        let job = monitor
+            .plan(due)
+            .into_iter()
+            .find(|job| job.id == 0)
+            .unwrap();
+        complete(&mut monitor, &job, Ok(usage(20.0)), due, wall);
+        assert!(monitor.services[0].retry_not_before.is_none());
+        monitor.force(due, true);
+        let job = monitor
+            .plan(due)
+            .into_iter()
+            .find(|job| job.id == 0)
+            .unwrap();
+        monitor.configure([false, true, false], due);
+        assert!(
+            !complete(
+                &mut monitor,
+                &job,
+                Err(PollError::RateLimited(Some(120_000))),
+                due,
+                wall
+            )
+            .accepted
+        );
+        monitor.configure([true, true, false], due);
+        assert!(monitor.plan(due).iter().all(|job| job.id != 0));
+    }
+
+    #[test]
+    fn hover_status_tracks_running_requests_schedules_and_auth_checks() {
+        let now = Instant::now();
+        let wall = SystemTime::now();
+        let mut monitor = Monitor::new([true, false, false], now);
+        let job = monitor.plan(now).remove(0);
+        assert!(monitor.services[0]
+            .description(wall, now, true)
+            .contains("正在刷新"));
+        assert!(monitor.services[0]
+            .description(wall, now, false)
+            .contains("Refreshing"));
+        complete(&mut monitor, &job, Ok(usage(20.0)), now, wall);
+        let description = monitor.services[0].description(wall, now, true);
+        assert!(description.contains("下次刷新："));
+        assert!(!description.contains("正在刷新"));
+        monitor.force(now, true);
+        let job = monitor.plan(now).remove(0);
+        complete(
+            &mut monitor,
+            &job,
+            Err(PollError::RateLimited(None)),
+            now,
+            wall,
+        );
+        assert!(monitor.services[0]
+            .description(wall, now, true)
+            .contains("下次重试："));
+        monitor.force(now, true);
+        let job = monitor.plan(now).remove(0);
+        complete(&mut monitor, &job, Err(PollError::NoCredentials), now, wall);
+        assert!(monitor.services[0]
+            .description(wall, now, true)
+            .contains("下次检查登录凭据："));
+    }
 
     #[test]
     fn codex_publishes_while_claude_is_still_waiting() {
@@ -594,7 +738,7 @@ mod tests {
         m.force(now, true);
         let job = m.plan(now).remove(0);
         m.force(now, true);
-        complete(&mut m, &job, Err(PollError::RateLimited), now, wall);
+        complete(&mut m, &job, Err(PollError::RateLimited(None)), now, wall);
         assert_eq!(m.cached().codex.unwrap().session.percentage, 55.0);
         assert_eq!(m.services[1].history.last_success, Some(wall));
         assert!(m.services[1].stale(wall));

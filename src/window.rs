@@ -1900,7 +1900,8 @@ fn update_quota_tooltips() {
                 if !visible {
                     continue;
                 }
-                let description = s.monitor.services[id].description(SystemTime::now(), chinese);
+                let description =
+                    s.monitor.services[id].description(SystemTime::now(), Instant::now(), chinese);
                 let mut text = format!("{name}\n{description}");
                 if s.monitor.services[id].error.is_some() && session == "!" {
                     text.push_str(if chinese {
@@ -2342,7 +2343,7 @@ fn poll_error_display_label(error: poller::PollError, language: LanguageId) -> &
                 "NET"
             }
         }
-        poller::PollError::RateLimited => {
+        poller::PollError::RateLimited(_) => {
             if language == LanguageId::SimplifiedChinese {
                 "限流"
             } else {
@@ -2405,6 +2406,16 @@ fn do_poll(send_hwnd: SendHwnd) {
         };
         s.monitor.plan(Instant::now())
     };
+    if !jobs.is_empty() {
+        unsafe {
+            let _ = PostMessageW(
+                send_hwnd.to_hwnd(),
+                WM_APP_USAGE_UPDATED,
+                WPARAM(0),
+                LPARAM(0),
+            );
+        }
+    }
     provider_poll::launch(
         jobs,
         |job| {
@@ -4280,7 +4291,7 @@ mod tests {
         );
         assert_eq!(
             poll_error_display_label(
-                poller::PollError::RateLimited,
+                poller::PollError::RateLimited(None),
                 LanguageId::SimplifiedChinese,
             ),
             "限流"

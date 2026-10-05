@@ -33,7 +33,7 @@ pub enum PollError {
     NoCredentials,
     TokenExpired,
     NetworkUnavailable,
-    RateLimited,
+    RateLimited(Option<u32>),
     ServerError,
     RequestFailed,
 }
@@ -51,7 +51,7 @@ impl PollError {
             Self::NoCredentials => "no_credentials",
             Self::TokenExpired => "token_expired",
             Self::NetworkUnavailable => "network_unavailable",
-            Self::RateLimited => "rate_limited",
+            Self::RateLimited(_) => "rate_limited",
             Self::ServerError => "server_error",
             Self::RequestFailed => "invalid_response",
         }
@@ -539,7 +539,7 @@ fn build_agent() -> Result<ureq::Agent, PollError> {
 fn classify_http_status(status: u16) -> PollError {
     match status {
         401 | 403 => PollError::AuthRequired,
-        429 => PollError::RateLimited,
+        429 => PollError::RateLimited(None),
         500..=599 => PollError::ServerError,
         _ => PollError::RequestFailed,
     }
@@ -547,6 +547,11 @@ fn classify_http_status(status: u16) -> PollError {
 
 fn classify_ureq_error(error: &ureq::Error) -> PollError {
     match error {
+        ureq::Error::Status(429, response) => PollError::RateLimited(
+            response
+                .header("Retry-After")
+                .and_then(|value| crate::retry_after::delay_ms(value, SystemTime::now())),
+        ),
         ureq::Error::Status(status, _) => classify_http_status(*status),
         ureq::Error::Transport(_) => PollError::NetworkUnavailable,
     }
@@ -703,6 +708,7 @@ fn try_usage_endpoint(token: &str) -> Result<Option<UsageData>, PollError> {
             ));
             return Err(PollError::AuthRequired);
         }
+        Err(error @ ureq::Error::Status(429, _)) => return Err(classify_ureq_error(&error)),
         Err(_) => return Ok(None),
     };
 
@@ -751,7 +757,17 @@ fn fetch_usage_via_messages(token: &str) -> Result<UsageData, PollError> {
                 return Err(PollError::AuthRequired);
             }
             Err(ureq::Error::Status(code, resp)) => {
-                last_error = classify_http_status(code);
+                last_error =
+                    if code == 429 {
+                        PollError::RateLimited(resp.header("Retry-After").and_then(|value| {
+                            crate::retry_after::delay_ms(value, SystemTime::now())
+                        }))
+                    } else {
+                        classify_http_status(code)
+                    };
+                if matches!(last_error, PollError::RateLimited(_)) {
+                    return Err(last_error);
+                }
                 resp
             }
             Err(error) => {
@@ -1813,10 +1829,24 @@ mod tests {
     }
 
     #[test]
+    fn rate_limit_response_preserves_valid_retry_hints() {
+        for (header, expected) in [("120", Some(120_000)), ("invalid", None)] {
+            let response: ureq::Response =
+                format!("HTTP/1.1 429 Too Many Requests\r\nRetry-After: {header}\r\n\r\n")
+                    .parse()
+                    .unwrap();
+            assert_eq!(
+                classify_ureq_error(&ureq::Error::Status(429, response)),
+                PollError::RateLimited(expected)
+            );
+        }
+    }
+
+    #[test]
     fn classifies_http_failures_for_user_visible_recovery() {
         assert_eq!(classify_http_status(401), PollError::AuthRequired);
         assert_eq!(classify_http_status(403), PollError::AuthRequired);
-        assert_eq!(classify_http_status(429), PollError::RateLimited);
+        assert_eq!(classify_http_status(429), PollError::RateLimited(None));
         assert_eq!(classify_http_status(500), PollError::ServerError);
         assert_eq!(classify_http_status(503), PollError::ServerError);
         assert_eq!(classify_http_status(404), PollError::RequestFailed);

@@ -11,6 +11,7 @@ mod quota_refresh;
 mod quota_text;
 mod quota_tooltip;
 mod recovery_events;
+mod retry_after;
 mod settings_store;
 mod theme;
 mod tray_icon;
