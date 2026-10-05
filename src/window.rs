@@ -21,8 +21,8 @@ use crate::diagnose;
 use crate::localization::{self, LanguageId, Strings};
 use crate::models::AppUsageData;
 use crate::native_interop::{
-    self, Color, TIMER_COUNTDOWN, TIMER_FRESHNESS, TIMER_POLL, TIMER_UPDATE_CHECK, WM_APP_TRAY,
-    WM_APP_USAGE_UPDATED,
+    self, Color, TIMER_COUNTDOWN, TIMER_FRESHNESS, TIMER_POLL, TIMER_TASKBAR_RETRY,
+    TIMER_UPDATE_CHECK, WM_APP_TRAY, WM_APP_USAGE_UPDATED,
 };
 use crate::poller;
 use crate::provider_icons::{self, Provider};
@@ -97,6 +97,7 @@ struct AppState {
 
     taskbar_index: usize,
     tray_offset: i32,
+    anchor_left: bool,
     dragging: bool,
     drag_start_mouse_x: i32,
     drag_start_client_x: i32,
@@ -127,6 +128,7 @@ const IDM_FREQ_1HOUR: u16 = 13;
 const IDM_ADAPTIVE_REFRESH: u16 = 14;
 const IDM_START_WITH_WINDOWS: u16 = 20;
 const IDM_RESET_POSITION: u16 = 30;
+const IDM_ANCHOR_LEFT: u16 = 34;
 const IDM_VERSION_ACTION: u16 = 31;
 const IDM_LANG_SYSTEM: u16 = 40;
 const IDM_LANG_ENGLISH: u16 = 41;
@@ -328,6 +330,8 @@ struct SettingsFile {
     #[serde(default)]
     tray_offset: i32,
     #[serde(default)]
+    anchor_left: bool,
+    #[serde(default)]
     taskbar_index: usize,
     #[serde(default = "default_poll_interval")]
     poll_interval_ms: u32,
@@ -359,6 +363,7 @@ impl Default for SettingsFile {
     fn default() -> Self {
         Self {
             tray_offset: 0,
+            anchor_left: false,
             taskbar_index: 0,
             poll_interval_ms: default_poll_interval(),
             adaptive_refresh: true,
@@ -487,6 +492,7 @@ fn save_state_settings() {
         let state = lock_state();
         state.as_ref().map(|s| SettingsFile {
             tray_offset: s.tray_offset,
+            anchor_left: s.anchor_left,
             taskbar_index: s.taskbar_index,
             poll_interval_ms: s.poll_interval_ms,
             adaptive_refresh: s.adaptive_refresh,
@@ -1296,7 +1302,11 @@ fn is_startup_enabled() -> bool {
     let Some(current_exe) = current_exe_path_string() else {
         return false;
     };
-    reg_value.eq_ignore_ascii_case(&current_exe)
+    startup_command_matches(&reg_value, &current_exe)
+}
+
+fn startup_command_matches(value: &str, exe: &str) -> bool {
+    value.trim().trim_matches('"').eq_ignore_ascii_case(exe)
 }
 
 fn current_exe_path_string() -> Option<String> {
@@ -1428,15 +1438,19 @@ fn set_startup_enabled(enable: bool) {
             let mut exe_buf = [0u16; 260];
             let len = GetModuleFileNameW(None, &mut exe_buf) as usize;
             if len > 0 {
-                // Write the wide string including null terminator
-                let byte_len = ((len + 1) * 2) as u32;
+                // Quoting also supports installation paths containing spaces.
+                let command = native_interop::wide_str(&format!(
+                    "\"{}\"",
+                    String::from_utf16_lossy(&exe_buf[..len])
+                ));
+                let byte_len = (command.len() * 2) as u32;
                 let _ = RegSetValueExW(
                     hkey,
                     PCWSTR::from_raw(key_name.as_ptr()),
                     0,
                     REG_SZ,
                     Some(std::slice::from_raw_parts(
-                        exe_buf.as_ptr() as *const u8,
+                        command.as_ptr() as *const u8,
                         byte_len as usize,
                     )),
                 );
@@ -1755,6 +1769,7 @@ pub fn run() {
                 last_update_check_unix: settings.last_update_check_unix,
                 taskbar_index: settings.taskbar_index,
                 tray_offset: settings.tray_offset,
+                anchor_left: settings.anchor_left,
                 dragging: false,
                 drag_start_mouse_x: 0,
                 drag_start_client_x: 0,
@@ -1766,6 +1781,9 @@ pub fn run() {
         // Try to embed in taskbar
         if attach_to_taskbar(hwnd, settings.taskbar_index) {
             embedded = true;
+        } else {
+            // During login Explorer may create its taskbar after this app starts.
+            SetTimer(hwnd, TIMER_TASKBAR_RETRY, 2_000, None);
         }
 
         // If not embedded, fall back to topmost popup with SetLayeredWindowAttributes
@@ -2595,7 +2613,7 @@ fn position_at_taskbar() {
     refresh_dpi();
     // Drop the app-state lock before any Win32 call that may synchronously
     // re-enter our window procedure.
-    let (hwnd, embedded, tray_offset, taskbar_hwnd) = {
+    let (hwnd, embedded, tray_offset, anchor_left, taskbar_hwnd) = {
         let state = lock_state();
         let s = match state.as_ref() {
             Some(s) => s,
@@ -2615,7 +2633,13 @@ fn position_at_taskbar() {
             }
         };
 
-        (s.hwnd.to_hwnd(), s.embedded, s.tray_offset, taskbar_hwnd)
+        (
+            s.hwnd.to_hwnd(),
+            s.embedded,
+            s.tray_offset,
+            s.anchor_left,
+            taskbar_hwnd,
+        )
     };
 
     let taskbar_rect = match native_interop::get_taskbar_rect(taskbar_hwnd) {
@@ -2643,7 +2667,7 @@ fn position_at_taskbar() {
     let offset_changed = {
         let mut state = lock_state();
         if let Some(s) = state.as_mut() {
-            if s.tray_offset != tray_offset {
+            if !anchor_left && s.tray_offset != tray_offset {
                 s.tray_offset = tray_offset;
                 true
             } else {
@@ -2661,7 +2685,13 @@ fn position_at_taskbar() {
     let y = compute_anchor_y(anchor_top, anchor_height, widget_height);
     if embedded {
         // Child window: coordinates relative to parent (taskbar)
-        let x = tray_left - taskbar_rect.left - widget_width - tray_offset;
+        let x = compute_anchor_x(
+            taskbar_rect.left,
+            tray_left,
+            widget_width,
+            tray_offset,
+            anchor_left,
+        ) - taskbar_rect.left;
         native_interop::move_window(hwnd, x, y - taskbar_rect.top, widget_width, widget_height);
         diagnose::log(format!(
             "positioned embedded widget at x={x} y={} w={widget_width} h={widget_height}",
@@ -2669,11 +2699,31 @@ fn position_at_taskbar() {
         ));
     } else {
         // Topmost popup: screen coordinates
-        let x = tray_left - widget_width - tray_offset;
+        let x = compute_anchor_x(
+            taskbar_rect.left,
+            tray_left,
+            widget_width,
+            tray_offset,
+            anchor_left,
+        );
         native_interop::move_window(hwnd, x, y, widget_width, widget_height);
         diagnose::log(format!(
             "positioned fallback widget at x={x} y={y} w={widget_width} h={widget_height}"
         ));
+    }
+}
+
+fn compute_anchor_x(
+    taskbar_left: i32,
+    tray_left: i32,
+    width: i32,
+    offset: i32,
+    anchor_left: bool,
+) -> i32 {
+    if anchor_left {
+        taskbar_left
+    } else {
+        (tray_left - width - offset).max(taskbar_left)
     }
 }
 
@@ -2814,6 +2864,25 @@ unsafe extern "system" fn wnd_proc(
                     render_layered();
                     schedule_countdown_timer();
                 }
+                TIMER_TASKBAR_RETRY => {
+                    let attachment = {
+                        let state = lock_state();
+                        state.as_ref().map(|s| (s.embedded, s.taskbar_index))
+                    };
+                    match attachment {
+                        Some((true, _)) | None => {
+                            let _ = KillTimer(hwnd, TIMER_TASKBAR_RETRY);
+                        }
+                        Some((false, index)) => {
+                            if attach_to_taskbar(hwnd, index) {
+                                let _ = KillTimer(hwnd, TIMER_TASKBAR_RETRY);
+                                position_at_taskbar();
+                                render_layered();
+                                diagnose::log("taskbar attached after startup retry");
+                            }
+                        }
+                    }
+                }
                 TIMER_FRESHNESS => {
                     update_display();
                     render_layered();
@@ -2868,6 +2937,9 @@ unsafe extern "system" fn wnd_proc(
             let _ = GetCursorPos(&mut pt);
             let mut state = lock_state();
             if let Some(s) = state.as_mut() {
+                if s.anchor_left {
+                    return LRESULT(0);
+                }
                 s.dragging = true;
                 s.drag_start_mouse_x = pt.x;
                 s.drag_start_client_x = client_x;
@@ -3082,6 +3154,17 @@ unsafe extern "system" fn wnd_proc(
                         let mut state = lock_state();
                         if let Some(s) = state.as_mut() {
                             s.tray_offset = 0;
+                            s.anchor_left = false;
+                        }
+                    }
+                    save_state_settings();
+                    position_at_taskbar();
+                }
+                IDM_ANCHOR_LEFT => {
+                    {
+                        let mut state = lock_state();
+                        if let Some(s) = state.as_mut() {
+                            s.anchor_left = !s.anchor_left;
                         }
                     }
                     save_state_settings();
@@ -3598,6 +3681,22 @@ fn show_context_menu(hwnd: HWND) {
             PCWSTR::from_raw(startup_str.as_ptr()),
         );
 
+        let anchored = lock_state().as_ref().is_some_and(|s| s.anchor_left);
+        let left_label = native_interop::wide_str(if language == LanguageId::SimplifiedChinese {
+            "固定在任务栏最左侧"
+        } else {
+            "Pin to the left edge of the taskbar"
+        });
+        let _ = AppendMenuW(
+            settings_menu,
+            if anchored {
+                MF_CHECKED
+            } else {
+                MENU_ITEM_FLAGS(0)
+            },
+            IDM_ANCHOR_LEFT as usize,
+            PCWSTR::from_raw(left_label.as_ptr()),
+        );
         let reset_pos_str = native_interop::wide_str(strings.reset_position);
         let _ = AppendMenuW(
             settings_menu,
@@ -4178,6 +4277,45 @@ mod tests {
             poll_error_display_label(poller::PollError::RequestFailed, LanguageId::English),
             "ERR"
         );
+    }
+
+    #[test]
+    fn left_anchor_is_stable_across_tray_width_widget_size_and_monitor_changes() {
+        for left in [0, -2560, 2560] {
+            for tray_width in [1600, 1800, 2000] {
+                for widget_width in [480, 606, 970] {
+                    assert_eq!(
+                        compute_anchor_x(left, left + tray_width, widget_width, 321, true),
+                        left
+                    );
+                }
+            }
+        }
+        assert_eq!(compute_anchor_x(0, 300, 606, 321, true), 0);
+        assert_eq!(compute_anchor_x(0, 2000, 606, 321, false), 1073);
+    }
+
+    #[test]
+    fn left_anchor_setting_round_trips_without_changing_manual_position() {
+        let mut settings = SettingsFile {
+            tray_offset: 321,
+            anchor_left: true,
+            ..SettingsFile::default()
+        };
+        let json = serde_json::to_string(&settings).unwrap();
+        settings = serde_json::from_str(&json).unwrap();
+        assert!(settings.anchor_left);
+        assert_eq!(settings.tray_offset, 321);
+        let legacy: SettingsFile = serde_json::from_str("{}").unwrap();
+        assert!(!legacy.anchor_left);
+    }
+
+    #[test]
+    fn startup_recognizes_quoted_commands_and_legacy_unquoted_paths() {
+        let path = r"C:\Program Files\Codex Usage\codex-usage.exe";
+        assert!(startup_command_matches(&format!("\"{path}\""), path));
+        assert!(startup_command_matches(path, path));
+        assert!(!startup_command_matches(r"C:\Other\codex-usage.exe", path));
     }
 
     #[test]
