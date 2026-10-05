@@ -2,6 +2,7 @@
 use crate::models::{AppUsageData, UsageData};
 use crate::poller::{CredentialWatchMode, CredentialWatchSnapshot, PollError};
 use crate::quota_refresh::{self, History, ResetRefresh};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 pub struct Service {
@@ -11,7 +12,8 @@ pub struct Service {
     pub interval_ms: u32,
     enabled: bool,
     generation: u64,
-    in_flight: bool,
+    in_flight: Option<u64>,
+    next_ticket: u64,
     forced: bool,
     retries: u32,
     due: Instant,
@@ -22,6 +24,7 @@ pub struct Service {
 pub struct Job {
     pub id: usize,
     generation: u64,
+    ticket: u64,
     forced: bool,
     auth: Option<(CredentialWatchMode, CredentialWatchSnapshot)>,
 }
@@ -101,6 +104,37 @@ pub fn execute(
     }
 }
 
+/// Run planned jobs off the caller thread and publish each result as it arrives.
+pub fn launch(
+    jobs: Vec<Job>,
+    poll: impl Fn(&Job) -> Attempt + Send + Sync + 'static,
+    complete: impl Fn(&Job, Attempt) + Send + Sync + 'static,
+) {
+    let poll = Arc::new(poll);
+    let complete = Arc::new(complete);
+    for job in jobs {
+        let worker_job = job.clone();
+        let worker_poll = poll.clone();
+        let worker_complete = complete.clone();
+        if let Err(error) = std::thread::Builder::new()
+            .name(format!("quota-provider-{}", job.id))
+            .spawn(move || {
+                crate::diagnose::log(format!("provider query started id={}", worker_job.id));
+                worker_complete(&worker_job, worker_poll(&worker_job));
+            })
+        {
+            crate::diagnose::log_error("unable to start provider query", error);
+            complete(
+                &job,
+                Attempt {
+                    result: Some(Err(PollError::RequestFailed)),
+                    auth: None,
+                },
+            );
+        }
+    }
+}
+
 impl Monitor {
     pub fn new(enabled: [bool; 3], now: Instant) -> Self {
         Self {
@@ -111,7 +145,8 @@ impl Monitor {
                 interval_ms: 900_000,
                 enabled: enabled[id],
                 generation: 0,
-                in_flight: false,
+                in_flight: None,
+                next_ticket: 0,
                 forced: false,
                 retries: 0,
                 due: now,
@@ -125,7 +160,6 @@ impl Monitor {
             if service.enabled != enabled {
                 service.enabled = enabled;
                 service.generation = service.generation.wrapping_add(1);
-                service.in_flight = false;
                 service.due = now;
                 service.forced = enabled;
             }
@@ -142,14 +176,16 @@ impl Monitor {
             .iter_mut()
             .enumerate()
             .filter_map(|(id, s)| {
-                if !s.enabled || s.in_flight || s.due > now {
+                if !s.enabled || s.in_flight.is_some() || s.due > now {
                     return None;
                 }
-                s.in_flight = true;
+                s.next_ticket = s.next_ticket.wrapping_add(1);
+                s.in_flight = Some(s.next_ticket);
                 let forced = std::mem::take(&mut s.forced);
                 Some(Job {
                     id,
                     generation: s.generation,
+                    ticket: s.next_ticket,
                     forced,
                     auth: s.auth.clone(),
                 })
@@ -166,14 +202,17 @@ impl Monitor {
         adaptive: bool,
     ) -> Completion {
         let s = &mut self.services[job.id];
-        if !s.enabled || s.generation != job.generation {
+        let owns_request = s.in_flight == Some(job.ticket);
+        if owns_request {
+            s.in_flight = None;
+        }
+        if !owns_request || !s.enabled || s.generation != job.generation {
             return Completion {
                 accepted: false,
                 successful: false,
                 notify_auth: false,
             };
         }
-        s.in_flight = false;
         let mut notify_auth = false;
         let mut successful = false;
         match attempt.result {
@@ -242,7 +281,7 @@ impl Monitor {
     pub fn delay_ms(&self, now: Instant, base: u32) -> u32 {
         self.services
             .iter()
-            .filter(|s| s.enabled && !s.in_flight)
+            .filter(|s| s.enabled && s.in_flight.is_none())
             .map(|s| {
                 s.due
                     .saturating_duration_since(now)
@@ -312,6 +351,127 @@ impl Service {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{mpsc, Mutex};
+
+    #[test]
+    fn codex_publishes_while_claude_is_still_waiting() {
+        let now = Instant::now();
+        let mut monitor = Monitor::new([true, true, false], now);
+        let jobs = monitor.plan(now);
+        let (release, wait) = mpsc::channel();
+        let wait = Mutex::new(wait);
+        let (finished, received) = mpsc::channel();
+        launch(
+            jobs,
+            move |job| {
+                if job.id == 0 {
+                    wait.lock().unwrap().recv().unwrap();
+                }
+                execute(job, || Ok(usage(40.0)), |_| vec![])
+            },
+            move |job, _| {
+                finished.send(job.id).unwrap();
+            },
+        );
+        let first = received.recv_timeout(Duration::from_secs(2));
+        release.send(()).unwrap();
+        assert_eq!(
+            first.unwrap(),
+            1,
+            "Codex must update before the blocked Claude query completes"
+        );
+        assert_eq!(received.recv_timeout(Duration::from_secs(2)).unwrap(), 0);
+    }
+
+    #[test]
+    fn fast_service_can_poll_again_while_the_other_service_is_still_in_flight() {
+        let now = Instant::now();
+        let wall = SystemTime::now();
+        let monitor = Arc::new(Mutex::new(Monitor::new([true, true, false], now)));
+        let jobs = monitor.lock().unwrap().plan(now);
+        let (release, wait) = mpsc::channel();
+        let wait = Mutex::new(wait);
+        let (finished, received) = mpsc::channel();
+        let state = monitor.clone();
+        let published = finished.clone();
+        launch(
+            jobs,
+            move |job| {
+                if job.id == 0 {
+                    wait.lock().unwrap().recv().unwrap();
+                }
+                execute(job, || Ok(usage(90.0)), |_| vec![])
+            },
+            move |job, attempt| {
+                assert!(
+                    state
+                        .lock()
+                        .unwrap()
+                        .finish(job, attempt, now, wall, 900_000, true)
+                        .accepted
+                );
+                published.send(job.id).unwrap();
+            },
+        );
+        let first = received.recv_timeout(Duration::from_secs(2));
+        if first.is_err() {
+            let _ = release.send(());
+        }
+        assert_eq!(first.unwrap(), 1);
+        let later = now + Duration::from_secs(60);
+        let jobs = monitor.lock().unwrap().plan(later);
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].id, 1);
+        let state = monitor.clone();
+        launch(
+            jobs,
+            |job| execute(job, || Ok(usage(85.0)), |_| vec![]),
+            move |job, attempt| {
+                assert!(
+                    state
+                        .lock()
+                        .unwrap()
+                        .finish(
+                            job,
+                            attempt,
+                            later,
+                            wall + Duration::from_secs(60),
+                            900_000,
+                            true
+                        )
+                        .accepted
+                );
+                finished.send(job.id).unwrap();
+            },
+        );
+        let second = received.recv_timeout(Duration::from_secs(2));
+        release.send(()).unwrap();
+        assert_eq!(
+            second.unwrap(),
+            1,
+            "Codex's next update must not wait for Claude"
+        );
+        assert_eq!(received.recv_timeout(Duration::from_secs(2)).unwrap(), 0);
+    }
+
+    #[test]
+    fn reenabled_service_waits_for_its_old_worker_and_duplicate_completion_cannot_release_a_new_job(
+    ) {
+        let now = Instant::now();
+        let wall = SystemTime::now();
+        let mut monitor = Monitor::new([false, true, false], now);
+        let old = monitor.plan(now).remove(0);
+        monitor.configure([true, false, false], now);
+        monitor.configure([true, true, false], now);
+        let jobs = monitor.plan(now);
+        assert_eq!(jobs.iter().map(|j| j.id).collect::<Vec<_>>(), vec![0]);
+        assert!(!complete(&mut monitor, &old, Ok(usage(20.0)), now, wall).accepted);
+        let new = monitor.plan(now).remove(0);
+        assert_eq!(new.id, 1);
+        assert!(!complete(&mut monitor, &old, Ok(usage(20.0)), now, wall).accepted);
+        assert!(monitor.plan(now).is_empty());
+        assert!(complete(&mut monitor, &new, Ok(usage(30.0)), now, wall).accepted);
+    }
     fn usage(used: f64) -> UsageData {
         let mut data = UsageData::default();
         data.session.percentage = used;

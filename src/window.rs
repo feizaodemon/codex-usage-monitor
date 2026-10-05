@@ -2398,7 +2398,6 @@ fn start_poll(hwnd: SendHwnd, queue: bool) {
 }
 
 fn do_poll(send_hwnd: SendHwnd) {
-    let hwnd = send_hwnd.to_hwnd();
     let jobs = {
         let mut state = lock_state();
         let Some(s) = state.as_mut() else {
@@ -2406,104 +2405,121 @@ fn do_poll(send_hwnd: SendHwnd) {
         };
         s.monitor.plan(Instant::now())
     };
-    for job in jobs {
-        let attempt = provider_poll::execute(
+    provider_poll::launch(
+        jobs,
+        |job| {
+            provider_poll::execute(
+                job,
+                || poller::poll_provider(job.id),
+                poller::credential_watch_snapshot,
+            )
+        },
+        move |job, attempt| complete_provider_poll(send_hwnd, job, attempt),
+    );
+}
+
+fn complete_provider_poll(
+    send_hwnd: SendHwnd,
+    job: &provider_poll::Job,
+    attempt: provider_poll::Attempt,
+) {
+    let hwnd = send_hwnd.to_hwnd();
+    let (alerts, auth_notice) = {
+        let mut state = lock_state();
+        let Some(s) = state.as_mut() else {
+            return;
+        };
+        let completion = s.monitor.finish(
             &job,
-            || poller::poll_provider(job.id),
-            poller::credential_watch_snapshot,
+            attempt,
+            Instant::now(),
+            SystemTime::now(),
+            s.poll_interval_ms,
+            s.adaptive_refresh,
         );
-        let (alerts, auth_notice) = {
-            let mut state = lock_state();
-            let Some(s) = state.as_mut() else {
-                return;
-            };
-            let completion = s.monitor.finish(
-                &job,
-                attempt,
-                Instant::now(),
-                SystemTime::now(),
-                s.poll_interval_ms,
-                s.adaptive_refresh,
-            );
-            if !completion.accepted {
-                continue;
-            }
-            let mut fresh = AppUsageData::default();
-            if completion.successful {
-                let data = s.monitor.services[job.id].data.clone();
-                match job.id {
-                    0 => fresh.claude_code = data,
-                    1 => fresh.codex = data,
-                    _ => fresh.antigravity = data,
-                }
-            }
-            let alerts = collect_low_quota_alerts(s, &fresh);
-            let cached = s.monitor.cached();
-            for (usage, session, weekly) in [
-                (
-                    cached.claude_code.as_ref(),
-                    &mut s.session_percent,
-                    &mut s.weekly_percent,
-                ),
-                (
-                    cached.codex.as_ref(),
-                    &mut s.codex_session_percent,
-                    &mut s.codex_weekly_percent,
-                ),
-                (
-                    cached.antigravity.as_ref(),
-                    &mut s.antigravity_session_percent,
-                    &mut s.antigravity_weekly_percent,
-                ),
-            ] {
-                *session = usage.map_or(0.0, |u| u.session.percentage);
-                *weekly = usage.map_or(0.0, |u| u.weekly.percentage);
-            }
-            s.data = Some(cached);
-            s.has_poll_result = true;
-            refresh_usage_texts(s);
+        if !completion.accepted {
+            // A selection change can leave a new request waiting for the old
+            // worker to finish. Release it without publishing the stale result.
             unsafe {
                 SetTimer(hwnd, TIMER_POLL, effective_poll_interval(s), None);
             }
-            let service = &s.monitor.services[job.id];
-            diagnose::log(format!(
-                "provider poll completed id={} error={:?} interval_ms={}",
-                job.id, service.error, service.interval_ms
-            ));
-            let notice = completion.notify_auth.then(|| {
-                let strings = s.language.strings();
-                match job.id {
-                    0 => (
-                        tray_icon::TrayIconKind::Claude,
-                        strings.token_expired_title,
-                        strings.token_expired_body,
-                    ),
-                    1 => (
-                        tray_icon::TrayIconKind::Codex,
-                        strings.codex_token_expired_title,
-                        strings.codex_token_expired_body,
-                    ),
-                    _ => (
-                        tray_icon::TrayIconKind::Antigravity,
-                        strings.antigravity_token_expired_title,
-                        strings.antigravity_token_expired_body,
-                    ),
-                }
-            });
-            (alerts, notice)
-        };
-        for alert in &alerts {
-            tray_icon::notify_balloon(hwnd, alert.kind, &alert.title, &alert.message);
+            return;
         }
-        if !alerts.is_empty() {
-            save_state_settings();
+        let mut fresh = AppUsageData::default();
+        if completion.successful {
+            let data = s.monitor.services[job.id].data.clone();
+            match job.id {
+                0 => fresh.claude_code = data,
+                1 => fresh.codex = data,
+                _ => fresh.antigravity = data,
+            }
         }
-        if let Some((kind, title, body)) = auth_notice {
-            tray_icon::notify_balloon(hwnd, kind, title, body);
+        let alerts = collect_low_quota_alerts(s, &fresh);
+        let cached = s.monitor.cached();
+        for (usage, session, weekly) in [
+            (
+                cached.claude_code.as_ref(),
+                &mut s.session_percent,
+                &mut s.weekly_percent,
+            ),
+            (
+                cached.codex.as_ref(),
+                &mut s.codex_session_percent,
+                &mut s.codex_weekly_percent,
+            ),
+            (
+                cached.antigravity.as_ref(),
+                &mut s.antigravity_session_percent,
+                &mut s.antigravity_weekly_percent,
+            ),
+        ] {
+            *session = usage.map_or(0.0, |u| u.session.percentage);
+            *weekly = usage.map_or(0.0, |u| u.weekly.percentage);
         }
+        s.data = Some(cached);
+        s.has_poll_result = true;
+        refresh_usage_texts(s);
         unsafe {
-            let _ = PostMessageW(hwnd, WM_APP_USAGE_UPDATED, WPARAM(0), LPARAM(0));
+            SetTimer(hwnd, TIMER_POLL, effective_poll_interval(s), None);
         }
+        let service = &s.monitor.services[job.id];
+        diagnose::log(format!(
+            "provider poll completed id={} error={:?} interval_ms={}",
+            job.id, service.error, service.interval_ms
+        ));
+        let notice = completion.notify_auth.then(|| {
+            let strings = s.language.strings();
+            match job.id {
+                0 => (
+                    tray_icon::TrayIconKind::Claude,
+                    strings.token_expired_title,
+                    strings.token_expired_body,
+                ),
+                1 => (
+                    tray_icon::TrayIconKind::Codex,
+                    strings.codex_token_expired_title,
+                    strings.codex_token_expired_body,
+                ),
+                _ => (
+                    tray_icon::TrayIconKind::Antigravity,
+                    strings.antigravity_token_expired_title,
+                    strings.antigravity_token_expired_body,
+                ),
+            }
+        });
+        (alerts, notice)
+    };
+    for alert in &alerts {
+        tray_icon::notify_balloon(hwnd, alert.kind, &alert.title, &alert.message);
+    }
+    if !alerts.is_empty() {
+        save_state_settings();
+    }
+    if let Some((kind, title, body)) = auth_notice {
+        tray_icon::notify_balloon(hwnd, kind, title, body);
+    }
+    unsafe {
+        let _ = PostMessageW(hwnd, WM_APP_USAGE_UPDATED, WPARAM(0), LPARAM(0));
     }
 }
 
