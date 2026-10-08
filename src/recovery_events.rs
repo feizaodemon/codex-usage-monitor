@@ -3,13 +3,15 @@ use crate::diagnose;
 use std::ffi::c_void;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
-use windows::Win32::Foundation::{BOOLEAN, HANDLE, HWND, LPARAM, WPARAM};
+use windows::core::{s, w};
+use windows::Win32::Foundation::{BOOLEAN, HANDLE, HWND, LPARAM, WIN32_ERROR, WPARAM};
 use windows::Win32::NetworkManagement::IpHelper::{
-    CancelMibChangeNotify2, NotifyNetworkConnectivityHintChange,
+    CancelMibChangeNotify2, PNETWORK_CONNECTIVITY_HINT_CHANGE_CALLBACK,
 };
 use windows::Win32::Networking::WinSock::{
     NetworkConnectivityLevelHintInternetAccess, NL_NETWORK_CONNECTIVITY_HINT,
 };
+use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
 use windows::Win32::System::Power::{
     RegisterSuspendResumeNotification, UnregisterSuspendResumeNotification, HPOWERNOTIFY,
 };
@@ -42,6 +44,22 @@ impl Debounce {
         true
     }
 }
+type NotifyHintChange = unsafe extern "system" fn(
+    PNETWORK_CONNECTIVITY_HINT_CHANGE_CALLBACK,
+    *const c_void,
+    BOOLEAN,
+    *mut HANDLE,
+) -> WIN32_ERROR;
+
+/// Windows 10 2004+ only. Resolved at runtime so older builds still start, without network recovery.
+unsafe fn notify_network_connectivity_hint_change() -> Option<NotifyHintChange> {
+    let module = LoadLibraryW(w!("iphlpapi.dll")).ok()?;
+    let function = GetProcAddress(module, s!("NotifyNetworkConnectivityHintChange"))?;
+    Some(std::mem::transmute::<
+        unsafe extern "system" fn() -> isize,
+        NotifyHintChange,
+    >(function))
+}
 pub struct Watch {
     power: Option<HPOWERNOTIFY>,
     network: isize,
@@ -65,9 +83,13 @@ impl Watch {
                 .map_err(|e| diagnose::log_error("wake notification registration failed", e))
                 .ok();
             let mut network = HANDLE::default();
-            let status = NotifyNetworkConnectivityHintChange(
+            let Some(notify) = notify_network_connectivity_hint_change() else {
+                diagnose::log("network notification unavailable on this Windows version");
+                return Self { power, network: 0 };
+            };
+            let status = notify(
                 Some(network_changed),
-                Some(hwnd.0 as *const c_void),
+                hwnd.0 as *const c_void,
                 BOOLEAN(1),
                 &mut network,
             );
