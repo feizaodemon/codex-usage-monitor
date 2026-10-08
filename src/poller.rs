@@ -11,7 +11,7 @@ use std::os::windows::process::CommandExt;
 
 use crate::diagnose;
 use crate::localization::Strings;
-use crate::models::{AppUsageData, UsageData, UsageSection};
+use crate::models::{UsageData, UsageSection};
 use crate::native_interop;
 
 const USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
@@ -33,7 +33,7 @@ pub enum PollError {
     NoCredentials,
     TokenExpired,
     NetworkUnavailable,
-    RateLimited,
+    RateLimited(Option<u32>),
     ServerError,
     RequestFailed,
 }
@@ -51,7 +51,7 @@ impl PollError {
             Self::NoCredentials => "no_credentials",
             Self::TokenExpired => "token_expired",
             Self::NetworkUnavailable => "network_unavailable",
-            Self::RateLimited => "rate_limited",
+            Self::RateLimited(_) => "rate_limited",
             Self::ServerError => "server_error",
             Self::RequestFailed => "invalid_response",
         }
@@ -63,6 +63,7 @@ pub enum CredentialWatchMode {
     ActiveSource,
     AllSources,
     Antigravity,
+    Codex,
 }
 
 pub type CredentialWatchSnapshot = Vec<String>;
@@ -198,80 +199,19 @@ extern "system" {
     fn CredFree(buffer: *mut c_void);
 }
 
-pub fn poll(
-    show_claude_code: bool,
-    show_codex: bool,
-    show_antigravity: bool,
-) -> Result<AppUsageData, PollError> {
-    poll_with(
-        show_claude_code,
-        show_codex,
-        show_antigravity,
-        poll_claude_code,
-        poll_codex,
-        poll_antigravity,
-    )
+pub fn poll_provider(id: usize) -> Result<UsageData, PollError> {
+    match id {
+        0 => poll_claude_code(),
+        1 => poll_codex(),
+        2 => poll_antigravity(),
+        _ => Err(PollError::RequestFailed),
+    }
 }
 
 /// Whether Claude Code CLI credentials are available from a supported source.
 /// Claude Desktop authentication is intentionally not treated as CLI access.
 pub fn claude_code_credentials_available() -> bool {
     read_first_credentials().is_some()
-}
-
-fn poll_with(
-    show_claude_code: bool,
-    show_codex: bool,
-    show_antigravity: bool,
-    mut poll_claude_code: impl FnMut() -> Result<UsageData, PollError>,
-    mut poll_codex: impl FnMut() -> Result<UsageData, PollError>,
-    mut poll_antigravity: impl FnMut() -> Result<UsageData, PollError>,
-) -> Result<AppUsageData, PollError> {
-    let mut data = AppUsageData::default();
-    let mut first_error = None;
-    let active_provider_count = show_claude_code as u8 + show_codex as u8 + show_antigravity as u8;
-
-    if show_claude_code {
-        match poll_claude_code() {
-            Ok(claude_code) => data.claude_code = Some(claude_code),
-            Err(error) => {
-                if active_provider_count > 1 {
-                    diagnose::log(format!("Claude Code usage poll failed: {error:?}"));
-                }
-                first_error.get_or_insert(error);
-            }
-        }
-    }
-
-    if show_codex {
-        match poll_codex() {
-            Ok(codex) => data.codex = Some(codex),
-            Err(error) => {
-                if active_provider_count > 1 {
-                    diagnose::log(format!("Codex usage poll failed: {error:?}"));
-                }
-                first_error.get_or_insert(error);
-            }
-        }
-    }
-
-    if show_antigravity {
-        match poll_antigravity() {
-            Ok(antigravity) => data.antigravity = Some(antigravity),
-            Err(error) => {
-                if active_provider_count > 1 {
-                    diagnose::log(format!("Antigravity usage poll failed: {error:?}"));
-                }
-                first_error.get_or_insert(error);
-            }
-        }
-    }
-
-    if data.claude_code.is_none() && data.codex.is_none() && data.antigravity.is_none() {
-        Err(first_error.unwrap_or(PollError::RequestFailed))
-    } else {
-        Ok(data)
-    }
 }
 
 fn poll_claude_code() -> Result<UsageData, PollError> {
@@ -599,7 +539,7 @@ fn build_agent() -> Result<ureq::Agent, PollError> {
 fn classify_http_status(status: u16) -> PollError {
     match status {
         401 | 403 => PollError::AuthRequired,
-        429 => PollError::RateLimited,
+        429 => PollError::RateLimited(None),
         500..=599 => PollError::ServerError,
         _ => PollError::RequestFailed,
     }
@@ -607,12 +547,22 @@ fn classify_http_status(status: u16) -> PollError {
 
 fn classify_ureq_error(error: &ureq::Error) -> PollError {
     match error {
+        ureq::Error::Status(429, response) => PollError::RateLimited(
+            response
+                .header("Retry-After")
+                .and_then(|value| crate::retry_after::delay_ms(value, SystemTime::now())),
+        ),
         ureq::Error::Status(status, _) => classify_http_status(*status),
         ureq::Error::Transport(_) => PollError::NetworkUnavailable,
     }
 }
 
 pub fn credential_watch_snapshot(mode: CredentialWatchMode) -> CredentialWatchSnapshot {
+    if mode == CredentialWatchMode::Codex {
+        return codex_auth_path()
+            .map(|p| vec![windows_credential_watch_signature(&p)])
+            .unwrap_or_default();
+    }
     if mode == CredentialWatchMode::Antigravity {
         return vec![antigravity_credential_watch_signature()];
     }
@@ -622,7 +572,7 @@ pub fn credential_watch_snapshot(mode: CredentialWatchMode) -> CredentialWatchSn
             .map(|creds| vec![creds.source])
             .unwrap_or_else(all_known_credential_sources),
         CredentialWatchMode::AllSources => all_known_credential_sources(),
-        CredentialWatchMode::Antigravity => unreachable!(),
+        CredentialWatchMode::Antigravity | CredentialWatchMode::Codex => unreachable!(),
     };
 
     let mut snapshot: CredentialWatchSnapshot = sources
@@ -676,7 +626,7 @@ fn windows_credential_watch_signature(path: &PathBuf) -> String {
                 .modified()
                 .ok()
                 .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
-                .map(|value| value.as_secs())
+                .map(|value| value.as_nanos())
                 .unwrap_or(0);
             format!("{key}|present|{}|{modified}", metadata.len())
         }
@@ -758,6 +708,7 @@ fn try_usage_endpoint(token: &str) -> Result<Option<UsageData>, PollError> {
             ));
             return Err(PollError::AuthRequired);
         }
+        Err(error @ ureq::Error::Status(429, _)) => return Err(classify_ureq_error(&error)),
         Err(_) => return Ok(None),
     };
 
@@ -806,7 +757,17 @@ fn fetch_usage_via_messages(token: &str) -> Result<UsageData, PollError> {
                 return Err(PollError::AuthRequired);
             }
             Err(ureq::Error::Status(code, resp)) => {
-                last_error = classify_http_status(code);
+                last_error =
+                    if code == 429 {
+                        PollError::RateLimited(resp.header("Retry-After").and_then(|value| {
+                            crate::retry_after::delay_ms(value, SystemTime::now())
+                        }))
+                    } else {
+                        classify_http_status(code)
+                    };
+                if matches!(last_error, PollError::RateLimited(_)) {
+                    return Err(last_error);
+                }
                 resp
             }
             Err(error) => {
@@ -1609,6 +1570,20 @@ fn is_leap(y: u64) -> bool {
     (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
 }
 
+/// Codex leaves absent windows as default sections. Its reported windows
+/// include a reset timestamp, including windows with zero usage.
+pub fn format_codex_line(
+    section: &UsageSection,
+    strings: Strings,
+    show_remaining_in_chinese: bool,
+    window: UsageWindowKind,
+) -> String {
+    if section.percentage == 0.0 && section.resets_at.is_none() {
+        return "--".to_string();
+    }
+    format_line(section, strings, show_remaining_in_chinese, window)
+}
+
 /// Format a usage section for the compact taskbar display.
 pub fn format_line(
     section: &UsageSection,
@@ -1643,20 +1618,17 @@ fn format_simplified_chinese_values(
     window: UsageWindowKind,
 ) -> String {
     let Some(reset) = reset else {
-        return format!("剩余{remaining:.0}%");
+        return format!("{remaining:.0}%");
     };
     match window {
         UsageWindowKind::Session => {
             format!(
-                "剩余{remaining:.0}%  {:02}:{:02}重置",
+                "{remaining:.0}%  {:02}:{:02}重置",
                 reset.wHour, reset.wMinute
             )
         }
         UsageWindowKind::Weekly => {
-            format!(
-                "剩余{remaining:.0}%  {:02}/{:02}重置",
-                reset.wMonth, reset.wDay
-            )
+            format!("{remaining:.0}%  {:02}/{:02}重置", reset.wMonth, reset.wDay)
         }
     }
 }
@@ -1720,22 +1692,30 @@ fn time_until_display_change_from_secs(total_secs: u64) -> Duration {
     Duration::from_secs(total_secs.saturating_sub(current_bucket_start) + 1)
 }
 
-/// Returns true if either section has reached "now" (reset time has passed).
-pub fn is_past_reset(data: &UsageData) -> bool {
-    let now = SystemTime::now();
-    let past = |s: &UsageSection| matches!(s.resets_at, Some(t) if now.duration_since(t).is_ok());
-    past(&data.session) || past(&data.weekly)
-}
-
-pub fn app_is_past_reset(data: &AppUsageData) -> bool {
-    data.claude_code.as_ref().is_some_and(is_past_reset)
-        || data.codex.as_ref().is_some_and(is_past_reset)
-        || data.antigravity.as_ref().is_some_and(is_past_reset)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn credential_signature_detects_same_length_rewrites_within_one_second() {
+        let path = std::env::temp_dir().join(format!(
+            "quota-credential-signature-{}.json",
+            std::process::id()
+        ));
+        let mut file = std::fs::File::create(&path).unwrap();
+        use std::io::Write;
+        file.write_all(b"fixture").unwrap();
+        let time = UNIX_EPOCH + Duration::from_secs(1700000000);
+        file.set_modified(time + Duration::from_millis(100))
+            .unwrap();
+        let before = windows_credential_watch_signature(&path);
+        file.set_modified(time + Duration::from_millis(200))
+            .unwrap();
+        let after = windows_credential_watch_signature(&path);
+        assert_ne!(before, after);
+        drop(file);
+        std::fs::remove_file(path).unwrap();
+    }
 
     #[test]
     fn claude_credentials_path_honors_custom_config_directory() {
@@ -1750,16 +1730,6 @@ mod tests {
             windows_credentials_path_from(None, Some(PathBuf::from(r"C:\Users\Ray"))),
             Some(PathBuf::from(r"C:\Users\Ray\.claude\.credentials.json"))
         );
-    }
-
-    fn usage_with_session_percent(percentage: f64) -> UsageData {
-        UsageData {
-            session: UsageSection {
-                percentage,
-                resets_at: None,
-            },
-            weekly: UsageSection::default(),
-        }
     }
 
     #[test]
@@ -1791,6 +1761,20 @@ mod tests {
         assert!(usage.session.resets_at.is_none());
         assert_eq!(usage.weekly.percentage, 21.0);
         assert!(usage.weekly.resets_at.is_some());
+        for language in [
+            crate::localization::LanguageId::SimplifiedChinese,
+            crate::localization::LanguageId::English,
+        ] {
+            assert_eq!(
+                format_codex_line(
+                    &usage.session,
+                    language.strings(),
+                    language == crate::localization::LanguageId::SimplifiedChinese,
+                    UsageWindowKind::Session,
+                ),
+                "--"
+            );
+        }
     }
 
     #[test]
@@ -1818,10 +1802,51 @@ mod tests {
     }
 
     #[test]
+    fn codex_session_only_zero_usage_keeps_real_quota_visible() {
+        let response: CodexUsageResponse = serde_json::from_str(
+            r#"{
+                "rate_limit": {
+                    "primary_window": {
+                        "used_percent": 0,
+                        "limit_window_seconds": 18000,
+                        "reset_at": 1784500338
+                    },
+                    "secondary_window": null
+                }
+            }"#,
+        )
+        .unwrap();
+        let usage = codex_usage_from_response(response).unwrap();
+        let strings = crate::localization::LanguageId::SimplifiedChinese.strings();
+        assert!(
+            format_codex_line(&usage.session, strings, true, UsageWindowKind::Session)
+                .starts_with("100%")
+        );
+        assert_eq!(
+            format_codex_line(&usage.weekly, strings, true, UsageWindowKind::Weekly),
+            "--"
+        );
+    }
+
+    #[test]
+    fn rate_limit_response_preserves_valid_retry_hints() {
+        for (header, expected) in [("120", Some(120_000)), ("invalid", None)] {
+            let response: ureq::Response =
+                format!("HTTP/1.1 429 Too Many Requests\r\nRetry-After: {header}\r\n\r\n")
+                    .parse()
+                    .unwrap();
+            assert_eq!(
+                classify_ureq_error(&ureq::Error::Status(429, response)),
+                PollError::RateLimited(expected)
+            );
+        }
+    }
+
+    #[test]
     fn classifies_http_failures_for_user_visible_recovery() {
         assert_eq!(classify_http_status(401), PollError::AuthRequired);
         assert_eq!(classify_http_status(403), PollError::AuthRequired);
-        assert_eq!(classify_http_status(429), PollError::RateLimited);
+        assert_eq!(classify_http_status(429), PollError::RateLimited(None));
         assert_eq!(classify_http_status(500), PollError::ServerError);
         assert_eq!(classify_http_status(503), PollError::ServerError);
         assert_eq!(classify_http_status(404), PollError::RequestFailed);
@@ -1842,7 +1867,7 @@ mod tests {
         };
         assert_eq!(
             format_line(&section, strings, true, UsageWindowKind::Session),
-            "剩余70%"
+            "70%"
         );
         let session_reset = windows::Win32::Foundation::SYSTEMTIME {
             wHour: 18,
@@ -1851,7 +1876,7 @@ mod tests {
         };
         assert_eq!(
             format_simplified_chinese_values(82.0, Some(session_reset), UsageWindowKind::Session,),
-            "剩余82%  18:30重置"
+            "82%  18:30重置"
         );
         let weekly_reset = windows::Win32::Foundation::SYSTEMTIME {
             wMonth: 7,
@@ -1860,71 +1885,8 @@ mod tests {
         };
         assert_eq!(
             format_simplified_chinese_values(97.0, Some(weekly_reset), UsageWindowKind::Weekly,),
-            "剩余97%  07/17重置"
+            "97%  07/17重置"
         );
-    }
-
-    #[test]
-    fn claude_failure_does_not_block_codex_when_both_are_enabled() {
-        let data = poll_with(
-            true,
-            true,
-            false,
-            || Err(PollError::AuthRequired),
-            || Ok(usage_with_session_percent(42.0)),
-            || unreachable!("antigravity is disabled"),
-        )
-        .expect("codex data should keep the poll successful");
-
-        assert!(data.claude_code.is_none());
-        assert_eq!(data.codex.unwrap().session.percentage, 42.0);
-    }
-
-    #[test]
-    fn codex_failure_does_not_block_claude_when_both_are_enabled() {
-        let data = poll_with(
-            true,
-            true,
-            false,
-            || Ok(usage_with_session_percent(64.0)),
-            || Err(PollError::RequestFailed),
-            || unreachable!("antigravity is disabled"),
-        )
-        .expect("claude data should keep the poll successful");
-
-        assert_eq!(data.claude_code.unwrap().session.percentage, 64.0);
-        assert!(data.codex.is_none());
-    }
-
-    #[test]
-    fn returns_first_error_when_no_enabled_provider_succeeds() {
-        let error = poll_with(
-            true,
-            true,
-            true,
-            || Err(PollError::AuthRequired),
-            || Err(PollError::RequestFailed),
-            || Err(PollError::NoCredentials),
-        )
-        .expect_err("all-provider failure should return an error");
-
-        assert_eq!(error, PollError::AuthRequired);
-    }
-
-    #[test]
-    fn antigravity_failure_does_not_block_codex_when_both_are_enabled() {
-        let data = poll_with(
-            false,
-            true,
-            true,
-            || unreachable!("claude code is disabled"),
-            || Ok(usage_with_session_percent(42.0)),
-            || Err(PollError::NoCredentials),
-        )
-        .expect("codex data should keep the poll successful");
-
-        assert!(data.antigravity.is_none());
-        assert_eq!(data.codex.unwrap().session.percentage, 42.0);
     }
 
     #[test]

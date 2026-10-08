@@ -19,8 +19,9 @@ pub const WINEVENT_OUTOFCONTEXT: u32 = 0x0000;
 // Timer IDs
 pub const TIMER_POLL: usize = 1;
 pub const TIMER_COUNTDOWN: usize = 2;
-pub const TIMER_RESET_POLL: usize = 3;
 pub const TIMER_UPDATE_CHECK: usize = 4;
+pub const TIMER_FRESHNESS: usize = 5;
+pub const TIMER_TASKBAR_RETRY: usize = 6;
 
 // Custom messages
 pub const WM_APP: u32 = 0x8000;
@@ -142,6 +143,11 @@ pub fn embed_in_taskbar(hwnd: HWND, taskbar_hwnd: HWND) {
     unsafe {
         // Preserve existing extended style, add tool window + no activate
         let ex_style = GetWindowLongW(hwnd, GWL_EXSTYLE);
+        // Reset alpha mode used by the startup popup fallback before switching
+        // back to UpdateLayeredWindow rendering inside the taskbar.
+        if ex_style & WS_EX_LAYERED.0 as i32 != 0 {
+            let _ = SetWindowLongW(hwnd, GWL_EXSTYLE, ex_style & !(WS_EX_LAYERED.0 as i32));
+        }
         let _ = SetWindowLongW(
             hwnd,
             GWL_EXSTYLE,
@@ -154,6 +160,97 @@ pub fn embed_in_taskbar(hwnd: HWND, taskbar_hwnd: HWND) {
         let _ = SetWindowLongW(hwnd, GWL_STYLE, new_style as i32);
 
         let _ = SetParent(hwnd, taskbar_hwnd);
+    }
+}
+
+#[cfg(test)]
+mod attachment_tests {
+    use super::*;
+    use windows::core::w;
+    use windows::Win32::Foundation::{COLORREF, POINT, SIZE};
+    use windows::Win32::Graphics::Gdi::*;
+
+    #[test]
+    fn startup_popup_can_switch_to_layered_child_rendering() {
+        unsafe {
+            let parent = CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                w!("STATIC"),
+                w!("attachment-test"),
+                WS_POPUP,
+                0,
+                0,
+                20,
+                20,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+            let child = CreateWindowExW(
+                WS_EX_LAYERED,
+                w!("STATIC"),
+                w!("widget-test"),
+                WS_POPUP,
+                0,
+                0,
+                2,
+                2,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+            SetLayeredWindowAttributes(child, COLORREF(0), 255, LWA_ALPHA).unwrap();
+            embed_in_taskbar(child, parent);
+            assert_eq!(GetParent(child).unwrap(), parent);
+            let dc = CreateCompatibleDC(None);
+            let info = BITMAPINFO {
+                bmiHeader: BITMAPINFOHEADER {
+                    biSize: 40,
+                    biWidth: 2,
+                    biHeight: -2,
+                    biPlanes: 1,
+                    biBitCount: 32,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let mut bits = std::ptr::null_mut();
+            let bitmap = CreateDIBSection(dc, &info, DIB_RGB_COLORS, &mut bits, None, 0).unwrap();
+            std::slice::from_raw_parts_mut(bits as *mut u32, 4).fill(0xffffffff);
+            let old = SelectObject(dc, bitmap);
+            let point = POINT { x: 0, y: 0 };
+            let size = SIZE { cx: 2, cy: 2 };
+            let blend = BLENDFUNCTION {
+                BlendOp: AC_SRC_OVER as u8,
+                SourceConstantAlpha: 255,
+                AlphaFormat: AC_SRC_ALPHA as u8,
+                ..Default::default()
+            };
+            let rendered = UpdateLayeredWindow(
+                child,
+                None,
+                Some(&point),
+                Some(&size),
+                dc,
+                Some(&point),
+                COLORREF(0),
+                Some(&blend),
+                ULW_ALPHA,
+            );
+            let _ = SelectObject(dc, old);
+            let _ = DeleteObject(bitmap);
+            let _ = DeleteDC(dc);
+            let _ = DestroyWindow(child);
+            let _ = DestroyWindow(parent);
+            assert!(
+                rendered.is_ok(),
+                "fallback alpha mode must not prevent taskbar rendering: {rendered:?}"
+            );
+        }
     }
 }
 

@@ -1,0 +1,3 @@
+Claude and OpenAI logo paths are from [Lobe Icons](https://github.com/lobehub/lobe-icons), licensed under MIT (see LICENSE). Brand names and marks belong to their respective owners.
+
+The SVG sources are retained here. `scripts/generate-provider-icons.ps1` renders the orange Claude and green OpenAI PNG resources using Windows WPF. They are embedded in the executable; no external icon files are needed at runtime.
