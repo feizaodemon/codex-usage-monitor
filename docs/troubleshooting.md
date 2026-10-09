@@ -25,7 +25,7 @@ codex-usage.exe --diagnose
 The log is written to `%TEMP%\codex-usage.log`. It includes:
 
 - application version and executable path
-- direct or WinGet install channel
+- install channel (direct or portable)
 - provider failure category and retry delay
 - window creation, taskbar placement, and relaunch events
 
@@ -34,12 +34,6 @@ The log does not include access tokens, refresh tokens, credential file contents
 ## Update failures
 
 Direct installations and portable copies download only the exact `codex-usage.exe` asset and verify it against `codex-usage.exe.sha256` from the same GitHub Release. The updater keeps the previous EXE until the downloaded version has been installed and restarted successfully. If restart fails, the old EXE is restored.
-
-WinGet-managed installations delegate upgrades to WinGet:
-
-```powershell
-winget upgrade --id Ray.CodexUsage --exact
-```
 
 ## Reset local position without deleting settings
 

@@ -40,10 +40,11 @@ v1.9.1 发布后，社区提交了 3 个 PR：#6（已用/剩余切换）、#7�
 - **2026-10-09**：新增功能属于用户可见行为升级，使用次版本号 `v1.10.0` 发布。
 - **2026-10-09**：用户决定不在 #6 下留言，#6 保持 open。
 - **2026-10-09**：WinGet 社区仓库审核不作为本迭代的结束条件，列为后续事项。
+- **2026-10-09**：迭代结束后，用户决定不上架 WinGet。关闭 microsoft/winget-pkgs#449231，删除仓库内清单和文档中的 WinGet 说明。
 
 ## 后续事项
 
-- [ ] WinGet 上架：[microsoft/winget-pkgs#449231](https://github.com/microsoft/winget-pkgs/pull/449231) 等待用户签署 CLA，之后由微软流水线和审核人员处理。上架后每次发布需提交 `Update: Ray.CodexUsage to X.Y.Z`。
+- [x] ~~WinGet 上架~~：用户于 2026-10-09 决定不上架。[microsoft/winget-pkgs#449231](https://github.com/microsoft/winget-pkgs/pull/449231) 已关闭；`packaging/winget` 与文档中的 WinGet 说明已删除。
 - [ ] #6 如需合并，先实现旧配置迁移：缺少 `quota_display_mode` 的简体中文配置保持“剩余”。
 - [ ] 高于 100% 的 DPI 缩放下，大字号行高未验证。
 - [ ] Windows 10 2004 之前的系统未实机验证。
