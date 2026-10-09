@@ -30,6 +30,12 @@ It sits in your taskbar and shows how much of your Codex usage window remains wi
 - Left-click the tray icon to toggle the taskbar widget on or off
 - Right-click options for refresh, monitored services, usage rows, quota alerts, update frequency, language, startup, widget visibility, and updates
 - Multi-monitor taskbar placement, so the widget can live on the taskbar for the screen you prefer
+- Appearance options for palette, bar style, bar thickness, and text size
+- Claude and OpenAI marks for each service column, with Codex shown in green
+- Quota windows that a service does not report show `--` and an empty bar instead of a false 100%
+- Each service refreshes and retries on its own; a failed refresh keeps the last numbers and marks them `*`
+- Hover over a service column to see its last successful update, next refresh, and any error
+- Automatic refresh after the computer wakes from sleep or the network comes back
 
 ## Who This Is For
 
@@ -47,6 +53,8 @@ It works best if you want a simple "how close am I to the limit?" display that i
 - Codex CLI or Codex app installed and authenticated
 - Optional: Claude Code installed and authenticated
 - Optional: Google Antigravity installed and authenticated, if you want Antigravity usage
+
+Refresh after network recovery needs Windows 10 version 2004 or later. On earlier Windows 10 builds the app still runs, but it only refreshes after wake from sleep and on its normal schedule.
 
 If you use Claude Code through WSL, that is supported too. The monitor can read your Claude Code credentials from Windows or from your WSL environment.
 
@@ -89,6 +97,7 @@ codex-usage
 Once running, it will appear in your taskbar and as one tray icon in the notification area.
 
 - Drag the left divider to move the taskbar widget
+- Choose **Settings → Pin to the left edge of the taskbar** to keep the widget at the left edge instead of next to the tray
 - On multi-monitor setups, choose **Settings → Display** from the right-click menu or drag the widget onto another taskbar. The selection is saved; the primary taskbar is used while the selected display is disconnected, and the widget returns when it reconnects.
 - Right-click the taskbar widget or tray icon for refresh, monitored services, usage rows, quota alerts, update frequency, Start with Windows, reset position, language, updates, and exit
 - Left-click the tray icon to toggle the taskbar widget on or off
@@ -119,6 +128,27 @@ Use the right-click **Usage display** menu to show both quota rows or only one. 
 Use **Quota alerts** to choose a remaining-quota threshold of 10%, 20%, or 30%. Alerts are off by default. Each provider and quota window is notified only once until its reset time changes, including across app restarts.
 
 In Simplified Chinese, the compact taskbar rows use `5h` / `7d`, remaining percentage, and a concrete local reset value such as `18:30重置` or `07/17重置`.
+
+Percentages use fixed digit columns, so the reset text does not shift when a value changes from `9%` to `10%`.
+
+### Refresh And Status
+
+Each enabled service keeps its own data, last successful update, error, and retry schedule. A slow or failing service does not delay or replace the numbers of another service.
+
+| Display | Meaning |
+| --- | --- |
+| `--` and an empty bar | The service did not report this quota window. For example, some Codex accounts only have a weekly limit. |
+| `*` after the reset text | The latest refresh failed or the data is old. The numbers are from the last successful refresh. |
+| `!`, `NET`, `429`, `5XX`, or `ERR` (Chinese: `!`, `网络`, `限流`, `服务`, `错误`) | The service has not returned data yet since the app started, and the label shows why. |
+
+Hover over a service column to see when it last updated successfully, when it refreshes or retries next, and the latest error. Missing Codex windows also get a short explanation.
+
+Refresh behavior:
+
+- **Update frequency** sets the normal interval. **Refresh every minute when remaining ≤20%** is on by default. It refreshes a service every minute while one of its quota windows has 20% or less left. A service with a used-up window keeps the normal interval, because it cannot use more quota until the reset.
+- Network and server errors retry with increasing delays. When a server answers `429` with a `Retry-After` time, the app waits until that time.
+- When a login expires or credentials are missing, the app stops retrying that service until its credentials file changes or you choose **Refresh**.
+- Shortly after a quota window resets, the app checks again so the new window shows quickly.
 
 ### Appearance
 
@@ -188,6 +218,7 @@ What the app stores locally:
 - Visible quota rows and low-quota alert threshold
 - Quota-window notification keys used to prevent duplicate alerts
 - Displayed model preferences
+- Appearance, selected display, left-edge pinning, and the faster-refresh setting
 
 What it does **not** do:
 
@@ -221,6 +252,8 @@ If the newer usage endpoint is unavailable, it can fall back to reading the rate
 ## Open Source
 
 This project is licensed under the MIT License. The original [LICENSE](LICENSE) and copyright notice are preserved.
+
+The Claude and OpenAI marks come from [Lobe Icons](https://github.com/lobehub/lobe-icons) under the MIT License. See [src/icons/providers](src/icons/providers). Brand names and marks belong to their owners.
 
 Codex Usage is a maintained derivative of [CodeZeno/Claude-Code-Usage-Monitor](https://github.com/CodeZeno/Claude-Code-Usage-Monitor). Thanks to Craig Constable and the upstream contributors for the original project. Changes in this repository are not affiliated with or endorsed by the upstream maintainers or OpenAI.
 
