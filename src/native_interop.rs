@@ -2,6 +2,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{BOOL, FILETIME, HWND, LPARAM, RECT, SYSTEMTIME};
+use windows::Win32::Graphics::Gdi::{
+    GetMonitorInfoW, MonitorFromPoint, MONITORINFO, MONITORINFOEXW, MONITOR_DEFAULTTONEAREST,
+};
 use windows::Win32::System::Time::{FileTimeToSystemTime, SystemTimeToTzSpecificLocalTime};
 use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
 use windows::Win32::UI::Shell::{SHAppBarMessage, ABM_GETTASKBARPOS, APPBARDATA};
@@ -52,6 +55,33 @@ pub fn system_time_to_local(value: SystemTime) -> Option<SYSTEMTIME> {
 pub struct TaskbarWindow {
     pub hwnd: HWND,
     pub rect: RECT,
+    pub is_primary: bool,
+}
+
+/// Windows display device name (for example \\.\DISPLAY2) for a taskbar.
+/// Unlike enumeration order, this survives taskbar recreation and rearrangement.
+pub fn taskbar_monitor_device(taskbar: &TaskbarWindow) -> Option<String> {
+    let point = windows::Win32::Foundation::POINT {
+        x: taskbar.rect.left + (taskbar.rect.right - taskbar.rect.left) / 2,
+        y: taskbar.rect.top + (taskbar.rect.bottom - taskbar.rect.top) / 2,
+    };
+    unsafe {
+        let monitor = MonitorFromPoint(point, MONITOR_DEFAULTTONEAREST);
+        if monitor.is_invalid() {
+            return None;
+        }
+        let mut info = MONITORINFOEXW::default();
+        info.monitorInfo.cbSize = std::mem::size_of::<MONITORINFOEXW>() as u32;
+        if !GetMonitorInfoW(monitor, &mut info as *mut _ as *mut MONITORINFO).as_bool() {
+            return None;
+        }
+        let len = info
+            .szDevice
+            .iter()
+            .position(|&c| c == 0)
+            .unwrap_or(info.szDevice.len());
+        Some(String::from_utf16_lossy(&info.szDevice[..len]))
+    }
 }
 
 pub fn find_taskbars() -> Vec<TaskbarWindow> {
@@ -63,7 +93,11 @@ pub fn find_taskbars() -> Vec<TaskbarWindow> {
             let class_name = String::from_utf16_lossy(&class_name[..len as usize]);
             if class_name == "Shell_TrayWnd" || class_name == "Shell_SecondaryTrayWnd" {
                 if let Some(rect) = get_taskbar_rect(hwnd).or_else(|| get_window_rect_safe(hwnd)) {
-                    taskbars.push(TaskbarWindow { hwnd, rect });
+                    taskbars.push(TaskbarWindow {
+                        hwnd,
+                        rect,
+                        is_primary: class_name == "Shell_TrayWnd",
+                    });
                 }
             }
         }

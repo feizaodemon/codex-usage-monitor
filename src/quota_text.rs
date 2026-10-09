@@ -7,8 +7,43 @@ use crate::native_interop::{self, Color};
 
 const DIGIT_CELL: i32 = 8;
 const PERCENT_CELL: i32 = 12;
-const PERCENT_WIDTH: i32 = DIGIT_CELL * 3 + PERCENT_CELL;
 const COLUMN_GAP: i32 = 8;
+/// Cell widths are tuned for 12 px text and grow with larger text.
+const BASE_FONT_PX: i32 = 12;
+
+fn cell(width: i32, font_px: i32) -> i32 {
+    (width * font_px + BASE_FONT_PX - 1) / BASE_FONT_PX
+}
+
+fn percent_width(font_px: i32) -> i32 {
+    cell(DIGIT_CELL, font_px) * 3 + cell(PERCENT_CELL, font_px)
+}
+
+/// Logical offset of the reset column from the start of the quota text.
+pub fn reset_offset(font_px: i32) -> i32 {
+    percent_width(font_px) + COLUMN_GAP
+}
+
+/// `height` is in physical pixels.
+pub unsafe fn create_reset_font(height: i32) -> HFONT {
+    let face = native_interop::wide_str("Microsoft YaHei UI");
+    CreateFontW(
+        -height,
+        0,
+        0,
+        0,
+        FW_NORMAL.0 as i32,
+        0,
+        0,
+        0,
+        DEFAULT_CHARSET.0 as u32,
+        OUT_TT_PRECIS.0 as u32,
+        CLIP_DEFAULT_PRECIS.0 as u32,
+        CLEARTYPE_QUALITY.0 as u32,
+        (DEFAULT_PITCH.0 | FF_DONTCARE.0) as u32,
+        PCWSTR(face.as_ptr()),
+    )
+}
 
 fn parts(text: &str) -> (&str, &str) {
     if let Some(end) = text.find('%') {
@@ -44,6 +79,7 @@ fn text(hdc: HDC, value: &str, mut rect: RECT, flags: DRAW_TEXT_FORMAT) {
 
 /// Each digit occupies a fixed cell; reset text starts at the same x for
 /// 0%, 9%, 99% and 100%. Status labels remain in the percentage column.
+/// `x`, `y`, `height` and `width` are physical pixels; `font_px` is logical.
 pub fn draw(
     hdc: HDC,
     x: i32,
@@ -52,14 +88,15 @@ pub fn draw(
     width: i32,
     value: &str,
     primary: &Color,
-    is_dark: bool,
+    secondary: &Color,
+    font_px: i32,
     scale: impl Fn(i32) -> i32,
 ) {
     let (percentage, reset) = parts(value);
     let rect = RECT {
         left: x,
         top: y,
-        right: x + scale(PERCENT_WIDTH),
+        right: x + scale(percent_width(font_px)),
         bottom: y + height,
     };
     unsafe {
@@ -70,12 +107,15 @@ pub fn draw(
             if glyph == ' ' {
                 continue;
             }
-            let left = x + scale(index as i32 * DIGIT_CELL);
-            let cell_width = if glyph == '%' {
-                PERCENT_CELL
-            } else {
-                DIGIT_CELL
-            };
+            let left = x + scale(index as i32 * cell(DIGIT_CELL, font_px));
+            let cell_width = cell(
+                if glyph == '%' {
+                    PERCENT_CELL
+                } else {
+                    DIGIT_CELL
+                },
+                font_px,
+            );
             text(
                 hdc,
                 &glyph.to_string(),
@@ -94,34 +134,17 @@ pub fn draw(
         return;
     }
 
-    let reset_x = x + scale(PERCENT_WIDTH + COLUMN_GAP);
-    let face = native_interop::wide_str("Microsoft YaHei UI");
+    let reset_x = x + scale(reset_offset(font_px));
     unsafe {
-        let font = CreateFontW(
-            -scale(12),
-            0,
-            0,
-            0,
-            FW_NORMAL.0 as i32,
-            0,
-            0,
-            0,
-            DEFAULT_CHARSET.0 as u32,
-            OUT_TT_PRECIS.0 as u32,
-            CLIP_DEFAULT_PRECIS.0 as u32,
-            CLEARTYPE_QUALITY.0 as u32,
-            (DEFAULT_PITCH.0 | FF_DONTCARE.0) as u32,
-            PCWSTR(face.as_ptr()),
-        );
+        let font = create_reset_font(scale(font_px));
         let old_font = SelectObject(hdc, font);
-        let secondary = Color::from_hex(if is_dark { "#B5B5B5" } else { "#666666" });
         let _ = SetTextColor(hdc, COLORREF(secondary.to_colorref()));
         text(
             hdc,
             reset,
             RECT {
                 left: reset_x,
-                right: x + scale(width),
+                right: x + width,
                 ..rect
             },
             DT_LEFT,
@@ -134,6 +157,13 @@ pub fn draw(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn larger_text_widens_cells_without_moving_standard_columns() {
+        assert_eq!(reset_offset(12), 8 * 3 + 12 + 8);
+        assert_eq!(cell(DIGIT_CELL, 13), 9);
+        assert_eq!(reset_offset(13), 9 * 3 + 13 + 8);
+    }
 
     #[test]
     fn percentages_keep_the_same_digit_and_percent_slots() {
