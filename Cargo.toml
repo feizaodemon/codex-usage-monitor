@@ -23,17 +23,23 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 dirs = "6"
 sha2 = "0.10"
+httpdate = "1"
 
 [dependencies.windows]
 version = "0.58"
 features = [
     "Win32_Foundation",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_Networking_WinSock",
+    "Win32_System_Power",
+    "Win32_Storage_FileSystem",
     "Win32_Globalization",
     "Win32_Graphics_Gdi",
     "Win32_System_LibraryLoader",
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
     "Win32_UI_Accessibility",
+    "Win32_UI_Controls",
     "Win32_System_Registry",
     "Win32_System_Threading",
     "Win32_System_Time",
