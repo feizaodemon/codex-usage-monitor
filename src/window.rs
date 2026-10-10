@@ -777,16 +777,12 @@ fn append_quota_alert(
     section: &crate::models::UsageSection,
 ) {
     let prefix = format!("{provider_key}:{window_key}:");
-    let reset_key = section
+    let reset = section
         .resets_at
         .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
-        .map(|value| value.as_secs().to_string())
-        .unwrap_or_else(|| "unknown".to_string());
-    let key = format!("{prefix}{reset_key}");
-    notified.retain(|existing| !existing.starts_with(&prefix) || existing == &key);
-
+        .map(|value| value.as_secs());
     let remaining = poller::remaining_percentage(section.percentage).round() as u8;
-    if remaining > threshold || !notified.insert(key) {
+    if !crate::quota_alerts::should_notify(notified, &prefix, reset, remaining, threshold) {
         return;
     }
 
@@ -2705,7 +2701,7 @@ fn complete_provider_poll(
     attempt: provider_poll::Attempt,
 ) {
     let hwnd = send_hwnd.to_hwnd();
-    let (alerts, auth_notice) = {
+    let (alerts, auth_notice, alert_state_changed) = {
         let mut state = lock_state();
         let Some(s) = state.as_mut() else {
             return;
@@ -2735,7 +2731,9 @@ fn complete_provider_poll(
                 _ => fresh.antigravity = data,
             }
         }
+        let previous_alert_keys = s.notified_quota_windows.clone();
         let alerts = collect_low_quota_alerts(s, &fresh);
+        let alert_state_changed = previous_alert_keys != s.notified_quota_windows;
         let cached = s.monitor.cached();
         for (usage, session, weekly) in [
             (
@@ -2788,12 +2786,12 @@ fn complete_provider_poll(
                 ),
             }
         });
-        (alerts, notice)
+        (alerts, notice, alert_state_changed)
     };
     for alert in &alerts {
         tray_icon::notify_balloon(hwnd, alert.kind, &alert.title, &alert.message);
     }
-    if !alerts.is_empty() {
+    if alert_state_changed {
         save_state_settings();
     }
     if let Some((kind, title, body)) = auth_notice {
@@ -5042,6 +5040,34 @@ mod tests {
         };
         assert_eq!(format_local_system_time(local), "2026-07-17 18:30");
         assert_eq!(format_precise_reset_time(None), None);
+    }
+
+    #[test]
+    fn low_quota_alert_does_not_repeat_when_reset_time_drifts() {
+        let mut alerts = Vec::new();
+        let mut notified = BTreeSet::new();
+        for seconds in [2_000_000_000, 2_000_000_001, 1_999_999_999] {
+            append_quota_alert(
+                &mut alerts,
+                &mut notified,
+                10,
+                LanguageId::SimplifiedChinese,
+                tray_icon::TrayIconKind::Claude,
+                "claude",
+                "Claude",
+                "session",
+                "5h",
+                &crate::models::UsageSection {
+                    percentage: 95.0,
+                    resets_at: Some(UNIX_EPOCH + Duration::from_secs(seconds)),
+                },
+            );
+        }
+        assert_eq!(
+            alerts.len(),
+            1,
+            "reset timestamp drift must not trigger another low-quota alert"
+        );
     }
 
     #[test]
